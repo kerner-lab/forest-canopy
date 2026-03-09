@@ -103,7 +103,6 @@ def finetune(model,
              model_name,
              train_dataset,
              val_dataset,
-             task,
              finetune,
              save_dir,
              wandb_exp,
@@ -111,8 +110,7 @@ def finetune(model,
              batch_size: int,
              learning_rate: float,
              weight_decay: float = 0,
-             waves=None,
-             num_classes=None):
+             ):
 
     # --- Split dataset into training and validation
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -132,13 +130,12 @@ def finetune(model,
 
     # Maintain criterion between models
     class_criterion = torch.nn.MSELoss()
-    
+
     # --- Freeze backbone if just want to train head of model
     if finetune == 'head':
         # freeze backbone
         for p in model.parameters():
             p.requires_grad = False
-
         # Backbone-specific head unfreeze
         if hasattr(model, "head"):
             for p in model.head.parameters():
@@ -169,7 +166,6 @@ def finetune(model,
         lr=learning_rate,
         weight_decay=weight_decay,
     )
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     # put everything on device
     model.to(device)

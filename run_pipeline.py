@@ -38,6 +38,8 @@ if __name__ == '__main__':
         if model_name == 'prithvi':
             backbone = BACKBONE_REGISTRY.build("prithvi_eo_v2_tiny_tl", pretrained=True)
             return prithvi.PrithviRegressor(backbone, img_channels=embedding_dict[embedding], num_outputs=1)
+        if model_name == 'randomforest':
+            # use a simple random forest to see how it does 
         else:
             return None
 

@@ -1,293 +1,318 @@
+#!/usr/bin/env python3
 """
-Script to run to query embeddings over gedi data
-Steps:
-1. load gedi data
-2. split into tiles, keeping geo information
-3. queru gee embeddings collection
-4. subset over tile
-5. save
+Script to tile Alpha Earth TIF files and match them with GEDI data.
+Creates 224x224 tiles with spatial alignment between input and target data.
 """
 
-import ee
-import numpy as np
-import rasterio
-from rasterio.windows import Window
-from rasterio.transform import from_bounds
-from rasterio.warp import transform_bounds
 import os
+import numpy as np
+from osgeo import gdal, osr
 from pathlib import Path
-import json
-import requests
-
-# Authenticate and initialize Earth Engine
-ee.Initialize(project='ee-kelseydoerksen')
-
-# Configuration
-input_tiff = '/Users/kdoerkse/Documents/JPL/data/gedi_rh98_30.0m_2019.tif'
-output_dir = '/Users/kdoerkse/Documents/JPL/data/tiles'
-tile_size = 224
-embedding_year = 2019
-
-# Create output directories
-Path(output_dir).mkdir(parents=True, exist_ok=True)
-Path(f"{output_dir}/gedi_tiles").mkdir(exist_ok=True)
-Path(f"{output_dir}/embeddings").mkdir(exist_ok=True)
+import argparse
 
 
-def split_tiff_into_tiles(input_path, tile_size=224):
-    """
-    Split large TIFF into tiles and return tile information
-    """
-    tiles_info = []
+class GeoTiffTiler:
+    def __init__(self, tile_size=224):
+        self.tile_size = tile_size
 
-    with rasterio.open(input_path) as src:
-        print(f"Input image shape: {src.width} x {src.height}")
-        print(f"CRS: {src.crs}")
-        print(f"Resolution: {src.res}")
-        print(f"Bands: {src.count}")
+    def get_geotransform_info(self, dataset):
+        """Extract geotransform and projection info from dataset."""
+        gt = dataset.GetGeoTransform()
+        proj = dataset.GetProjection()
+        return gt, proj
 
-        # Store profile before closing
-        src_profile = src.profile.copy()
-        src_crs = src.crs
-        src_transform = src.transform
-        src_width = src.width
-        src_height = src.height
+    def pixel_to_geo(self, geotransform, px, py):
+        """Convert pixel coordinates to geographic coordinates."""
+        geo_x = geotransform[0] + px * geotransform[1] + py * geotransform[2]
+        geo_y = geotransform[3] + px * geotransform[4] + py * geotransform[5]
+        return geo_x, geo_y
 
-        # Calculate number of tiles
-        n_tiles_x = (src_width + tile_size - 1) // tile_size
-        n_tiles_y = (src_height + tile_size - 1) // tile_size
+    def geo_to_pixel(self, geotransform, geo_x, geo_y):
+        """Convert geographic coordinates to pixel coordinates."""
+        det = geotransform[1] * geotransform[5] - geotransform[2] * geotransform[4]
+        px = (geotransform[5] * (geo_x - geotransform[0]) -
+              geotransform[2] * (geo_y - geotransform[3])) / det
+        py = (-geotransform[4] * (geo_x - geotransform[0]) +
+              geotransform[1] * (geo_y - geotransform[3])) / det
+        return int(round(px)), int(round(py))
 
-        print(f"Will create {n_tiles_x} x {n_tiles_y} = {n_tiles_x * n_tiles_y} tiles")
+    def get_overlap_region(self, src_ds, target_ds):
+        """Calculate the overlapping region between source and target datasets."""
+        src_gt, src_proj = self.get_geotransform_info(src_ds)
+        target_gt, target_proj = self.get_geotransform_info(target_ds)
 
-        # Iterate through tiles
-        for i in range(n_tiles_y):
-            for j in range(n_tiles_x):
-                # Calculate window
-                col_off = j * tile_size
-                row_off = i * tile_size
-                width = min(tile_size, src_width - col_off)
-                height = min(tile_size, src_height - row_off)
+        # Get bounds of source image
+        src_width = src_ds.RasterXSize
+        src_height = src_ds.RasterYSize
 
-                window = Window(col_off, row_off, width, height)
+        src_ul_x, src_ul_y = self.pixel_to_geo(src_gt, 0, 0)
+        src_lr_x, src_lr_y = self.pixel_to_geo(src_gt, src_width, src_height)
 
-                # Get transform for this tile
-                tile_transform = src.window_transform(window)
+        # Get bounds of target image
+        target_width = target_ds.RasterXSize
+        target_height = target_ds.RasterYSize
 
-                # Calculate geographic bounds
-                left = tile_transform.c
-                top = tile_transform.f
-                right = left + width * tile_transform.a
-                bottom = top + height * tile_transform.e
+        target_ul_x, target_ul_y = self.pixel_to_geo(target_gt, 0, 0)
+        target_lr_x, target_lr_y = self.pixel_to_geo(target_gt, target_width, target_height)
 
-                # Create bounds in lat/lon (EPSG:4326) for Earth Engine
-                if str(src_crs) != 'EPSG:4326':
-                    bounds_4326 = transform_bounds(src_crs, 'EPSG:4326',
-                                                   left, bottom, right, top)
-                else:
-                    bounds_4326 = (left, bottom, right, top)
+        # Calculate overlap in geographic coordinates
+        overlap_ul_x = max(src_ul_x, target_ul_x)
+        overlap_ul_y = min(src_ul_y, target_ul_y)
+        overlap_lr_x = min(src_lr_x, target_lr_x)
+        overlap_lr_y = max(src_lr_y, target_lr_y)
 
-                tile_info = {
-                    'tile_id': f"tile_{i:04d}_{j:04d}",
-                    'row': i,
-                    'col': j,
-                    'window': (col_off, row_off, width, height),  # Store as tuple
-                    'transform': tile_transform,
-                    'bounds': (left, bottom, right, top),
-                    'bounds_4326': bounds_4326,  # For Earth Engine
-                    'crs': src_crs,
-                    'width': width,
-                    'height': height
-                }
-
-                tiles_info.append(tile_info)
-
-    return tiles_info, src_profile
-
-
-def save_gedi_tile(input_path, tile_info, output_dir):
-    """
-    Save the GEDI TIFF tile with proper georeferencing
-    """
-    try:
-        with rasterio.open(input_path) as src:
-            # Read the window
-            col_off, row_off, width, height = tile_info['window']
-            window = Window(col_off, row_off, width, height)
-
-            # Read data
-            data = src.read(window=window)
-
-            # Update profile for this tile
-            tile_profile = src.profile.copy()
-            tile_profile.update({
-                'height': height,
-                'width': width,
-                'transform': tile_info['transform']
-            })
-
-            # Save tile
-            output_path = os.path.join(output_dir, 'gedi_tiles',
-                                       f"{tile_info['tile_id']}_gedi.tif")
-
-            with rasterio.open(output_path, 'w', **tile_profile) as dst:
-                dst.write(data)
-
-            print(f"  Saved GEDI tile: {output_path}")
-            return output_path
-
-    except Exception as e:
-        print(f"  Error saving GEDI tile {tile_info['tile_id']}: {e}")
-        return None
-
-
-def get_embeddings_for_tile(tile_info, year):
-    """
-    Extract embeddings for a specific tile using Earth Engine
-    Resample to match the GEDI resolution
-    """
-    try:
-        # Create Earth Engine geometry from bounds (in EPSG:4326)
-        west, south, east, north = tile_info['bounds_4326']
-        region = ee.Geometry.Rectangle([west, south, east, north])
-
-        # Load embedding collection
-        ae = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
-
-        # Filter to tile and year
-        embedding = ae.filterDate(f'{year}-01-01', f'{year + 1}-01-01') \
-            .filterBounds(region) \
-            .median() \
-            .clip(region)
-
-        # get projection
-        native_projection = ae.first().projection()
-
-        # Set the default projection before reduceResolution
-        embedding = embedding.setDefaultProjection(native_projection)
-
-        # Aggregate from native resolution to 30m using MEAN
-        # This properly averages the 10m pixels into 30m pixels
-        embedding_30m = embedding.reduceResolution(
-            reducer=ee.Reducer.mean(),
-            maxPixels=1024
-        ).reproject(
-            crs='EPSG:4326',
-            scale=30
-        )
-
-        # Get URL for download
-        url = embedding_30m.getDownloadURL({
-            'scale': 30,
-            'region': region,
-            'format': 'GEO_TIFF'
-        })
-
-        return {'url': url, 'region': region}
-
-    except Exception as e:
-        print(f"  Error getting embeddings for tile {tile_info['tile_id']}: {e}")
-        return None
-
-
-def download_and_save_embedding(embedding_info, tile_info, output_dir):
-    """
-    Download embedding from Earth Engine and save as GeoTIFF
-    """
-    if embedding_info is None:
-        return None
-
-    try:
-        # Download the file
-        response = requests.get(embedding_info['url'])
-
-        if response.status_code == 200:
-            # Save directly
-            output_path = os.path.join(output_dir, 'embeddings',
-                                       f"{tile_info['tile_id']}_embeddings.tif")
-
-            with open(output_path, 'wb') as f:
-                f.write(response.content)
-
-            print(f"  Saved embedding tile: {output_path}")
-            return output_path
-        else:
-            print(f"  Failed to download tile {tile_info['tile_id']}: {response.status_code}")
+        # Check if there's any overlap
+        if overlap_ul_x >= overlap_lr_x or overlap_ul_y <= overlap_lr_y:
             return None
 
-    except Exception as e:
-        print(f"  Error downloading tile {tile_info['tile_id']}: {e}")
-        return None
+        # Convert overlap to pixel coordinates for both images
+        src_overlap_px_ul = self.geo_to_pixel(src_gt, overlap_ul_x, overlap_ul_y)
+        src_overlap_px_lr = self.geo_to_pixel(src_gt, overlap_lr_x, overlap_lr_y)
 
+        target_overlap_px_ul = self.geo_to_pixel(target_gt, overlap_ul_x, overlap_ul_y)
+        target_overlap_px_lr = self.geo_to_pixel(target_gt, overlap_lr_x, overlap_lr_y)
 
-def process_tiff_with_embeddings(input_tiff, output_dir, tile_size=224, embedding_year=2019,
-                                 max_tiles=None, start_tile=0):
-    """
-    Main function to process large TIFF - saves both GEDI tiles and embeddings
+        return {
+            'src_offset': src_overlap_px_ul,
+            'src_size': (src_overlap_px_lr[0] - src_overlap_px_ul[0],
+                         src_overlap_px_lr[1] - src_overlap_px_ul[1]),
+            'target_offset': target_overlap_px_ul,
+            'target_size': (target_overlap_px_lr[0] - target_overlap_px_ul[0],
+                            target_overlap_px_lr[1] - target_overlap_px_ul[1]),
+            'geo_bounds': (overlap_ul_x, overlap_ul_y, overlap_lr_x, overlap_lr_y)
+        }
 
-    Args:
-        max_tiles: Optional limit on number of tiles to process (for testing)
-        start_tile: Start from this tile index (for resuming)
-    """
-    print("Step 1: Splitting TIFF into tiles...")
-    tiles_info, src_profile = split_tiff_into_tiles(input_tiff, tile_size)
+    def dequantize_embeddings(self, values):
+        """
+        Dequantize embedding values.
 
-    # Optionally limit tiles for testing
-    if max_tiles:
-        tiles_info = tiles_info[start_tile:start_tile + max_tiles]
-        print(f"Processing tiles {start_tile} to {start_tile + len(tiles_info)}")
+        Args:
+            values: Quantized embedding values
 
-    print(f"\nStep 2: Processing {len(tiles_info)} tiles...")
+        Returns:
+            Dequantized values
+        """
+        return ((values / 127.5) ** 2) * np.sign(values)
 
-    successful_gedi = 0
-    successful_embeddings = 0
-    failed = 0
+    def create_tiles(self, src_path, target_path, output_dir, save_embeddings_as_npy=True):
+        """
+        Create matched tiles from source and target datasets.
 
-    for idx, tile_info in enumerate(tiles_info):
-        print(f"\nProcessing tile {idx + 1}/{len(tiles_info)}: {tile_info['tile_id']}")
+        Args:
+            src_path: Path to Alpha Earth TIF file
+            target_path: Path to GEDI data TIF file
+            output_dir: Directory to save tiles
+            save_embeddings_as_npy: If True, dequantize and save embeddings as .npy files
+        """
+        # Open datasets
+        src_ds = gdal.Open(src_path)
+        target_ds = gdal.Open(target_path)
 
-        # Save GEDI tile
-        gedi_path = save_gedi_tile(input_tiff, tile_info, output_dir)
-        if gedi_path:
-            successful_gedi += 1
+        if src_ds is None:
+            raise ValueError(f"Could not open source file: {src_path}")
+        if target_ds is None:
+            raise ValueError(f"Could not open target file: {target_path}")
 
-        # Get embeddings from Earth Engine
-        embedding_info = get_embeddings_for_tile(tile_info, embedding_year)
+        # Get overlap region
+        overlap = self.get_overlap_region(src_ds, target_ds)
 
-        # Download and save the embedding tile
-        if embedding_info:
-            result = download_and_save_embedding(embedding_info, tile_info, output_dir)
-            if result:
-                successful_embeddings += 1
-            else:
-                failed += 1
+        if overlap is None:
+            print(f"No overlap found between {src_path} and {target_path}")
+            return 0
+
+        # Create output directories
+        src_basename = Path(src_path).stem
+        src_tile_dir = Path(output_dir) / 'input_tiles' / src_basename
+        target_tile_dir = Path(output_dir) / 'target_tiles' / src_basename
+        src_tile_dir.mkdir(parents=True, exist_ok=True)
+        target_tile_dir.mkdir(parents=True, exist_ok=True)
+
+        # Read overlap regions
+        src_overlap_data = src_ds.ReadAsArray(
+            overlap['src_offset'][0],
+            overlap['src_offset'][1],
+            overlap['src_size'][0],
+            overlap['src_size'][1]
+        )
+
+        target_overlap_data = target_ds.ReadAsArray(
+            overlap['target_offset'][0],
+            overlap['target_offset'][1],
+            overlap['target_size'][0],
+            overlap['target_size'][1]
+        )
+
+        # Ensure both have the same shape (handle potential rounding differences)
+        min_width = min(src_overlap_data.shape[-1], target_overlap_data.shape[-1])
+        min_height = min(src_overlap_data.shape[-2], target_overlap_data.shape[-2])
+
+        if len(src_overlap_data.shape) == 3:
+            src_overlap_data = src_overlap_data[:, :min_height, :min_width]
         else:
-            failed += 1
+            src_overlap_data = src_overlap_data[:min_height, :min_width]
 
-        # Save tile metadata
-        metadata_path = os.path.join(output_dir,
-                                     f"{tile_info['tile_id']}_metadata.json")
-        with open(metadata_path, 'w') as f:
-            json.dump({
-                'tile_id': tile_info['tile_id'],
-                'bounds': tile_info['bounds'],
-                'bounds_4326': tile_info['bounds_4326'],
-                'crs': str(tile_info['crs']),
-                'width': tile_info['width'],
-                'height': tile_info['height'],
-                'row': tile_info['row'],
-                'col': tile_info['col'],
-                'gedi_tile': f"gedi_tiles/{tile_info['tile_id']}_gedi.tif" if gedi_path else None,
-                'embedding_tile': f"embeddings/{tile_info['tile_id']}_embeddings.tif"
-            }, f, indent=2)
+        if len(target_overlap_data.shape) == 3:
+            target_overlap_data = target_overlap_data[:, :min_height, :min_width]
+        else:
+            target_overlap_data = target_overlap_data[:min_height, :min_width]
 
-    print(f"\nProcessing complete!")
-    print(f"GEDI tiles saved: {successful_gedi}")
-    print(f"Embedding tiles saved: {successful_embeddings}")
-    print(f"Failed embeddings: {failed}")
+        # Calculate number of tiles
+        n_tiles_x = min_width // self.tile_size
+        n_tiles_y = min_height // self.tile_size
+
+        tile_count = 0
+        src_gt, _ = self.get_geotransform_info(src_ds)
+
+        # Create tiles
+        for i in range(n_tiles_y):
+            for j in range(n_tiles_x):
+                # Extract tile
+                y_start = i * self.tile_size
+                x_start = j * self.tile_size
+
+                if len(src_overlap_data.shape) == 3:
+                    src_tile = src_overlap_data[:, y_start:y_start + self.tile_size,
+                    x_start:x_start + self.tile_size]
+                else:
+                    src_tile = src_overlap_data[y_start:y_start + self.tile_size,
+                    x_start:x_start + self.tile_size]
+
+                if len(target_overlap_data.shape) == 3:
+                    target_tile = target_overlap_data[:, y_start:y_start + self.tile_size,
+                    x_start:x_start + self.tile_size]
+                else:
+                    target_tile = target_overlap_data[y_start:y_start + self.tile_size,
+                    x_start:x_start + self.tile_size]
+
+                # Save tiles
+                tile_basename = f"tile_{i:04d}_{j:04d}"
+
+                # Save input (embedding) tiles
+                if save_embeddings_as_npy:
+                    # Dequantize embeddings
+                    dequantized_tile = self.dequantize_embeddings(src_tile.astype(np.float32))
+
+                    # Save as .npy
+                    npy_path = src_tile_dir / f"{tile_basename}.npy"
+                    np.save(npy_path, dequantized_tile)
+
+                    # Save first 3 tiles as TIF for QGIS verification
+                    if tile_count < 3:
+                        tif_path = src_tile_dir / f"{tile_basename}.tif"
+                        self.save_tile(dequantized_tile, tif_path, src_ds,
+                                       overlap['src_offset'][0] + x_start,
+                                       overlap['src_offset'][1] + y_start)
+                else:
+                    # Save as TIF
+                    tif_path = src_tile_dir / f"{tile_basename}.tif"
+                    self.save_tile(src_tile, tif_path, src_ds,
+                                   overlap['src_offset'][0] + x_start,
+                                   overlap['src_offset'][1] + y_start)
+
+                # Save target (GEDI) tiles as TIF
+                target_tile_name = f"{tile_basename}.tif"
+                self.save_tile(target_tile, target_tile_dir / target_tile_name, target_ds,
+                               overlap['target_offset'][0] + x_start,
+                               overlap['target_offset'][1] + y_start)
+
+                tile_count += 1
+
+        print(f"Created {tile_count} tile pairs from {src_basename}")
+        return tile_count
+
+    def save_tile(self, tile_data, output_path, reference_ds, x_offset, y_offset):
+        """Save a tile as a GeoTIFF with proper georeferencing."""
+        driver = gdal.GetDriverByName('GTiff')
+
+        # Handle multi-band vs single-band
+        if len(tile_data.shape) == 3:
+            n_bands = tile_data.shape[0]
+            height = tile_data.shape[1]
+            width = tile_data.shape[2]
+        else:
+            n_bands = 1
+            height = tile_data.shape[0]
+            width = tile_data.shape[1]
+            tile_data = tile_data.reshape(1, height, width)
+
+        # Create output dataset
+        out_ds = driver.Create(str(output_path), width, height, n_bands,
+                               gdal.GDT_Float32)
+
+        # Set geotransform
+        ref_gt = reference_ds.GetGeoTransform()
+        new_gt = list(ref_gt)
+        new_gt[0] = ref_gt[0] + x_offset * ref_gt[1]
+        new_gt[3] = ref_gt[3] + y_offset * ref_gt[5]
+        out_ds.SetGeoTransform(new_gt)
+
+        # Set projection
+        out_ds.SetProjection(reference_ds.GetProjection())
+
+        # Write data
+        for i in range(n_bands):
+            out_band = out_ds.GetRasterBand(i + 1)
+            out_band.WriteArray(tile_data[i])
+            out_band.FlushCache()
+
+        out_ds = None
 
 
-if __name__ == "__main__":
-    process_tiff_with_embeddings(input_tiff=input_tiff,
-                                 output_dir=output_dir,
-                                 tile_size=tile_size,
-                                 embedding_year=embedding_year)
+def main():
+    parser = argparse.ArgumentParser(
+        description='Tile Alpha Earth files and match with GEDI data'
+    )
+    parser.add_argument('--alpha-earth-dir', required=True,
+                        help='Directory containing Alpha Earth TIF files')
+    parser.add_argument('--gedi-file', required=True,
+                        help='Path to GEDI data TIF file')
+    parser.add_argument('--output-dir', required=True,
+                        help='Output directory for tiles')
+    parser.add_argument('--tile-size', type=int, default=224,
+                        help='Tile size (default: 224)')
+    parser.add_argument('--save-embeddings-as-tif', action='store_true',
+                        help='Save embeddings as TIF instead of dequantized NPY (default: save as NPY)')
+
+    args = parser.parse_args()
+
+    # Create tiler
+    tiler = GeoTiffTiler(tile_size=args.tile_size)
+
+    # Get all Alpha Earth files
+    alpha_earth_files = list(Path(args.alpha_earth_dir).glob('*.tif')) + \
+                        list(Path(args.alpha_earth_dir).glob('*.tiff'))
+
+    if not alpha_earth_files:
+        print(f"No TIF files found in {args.alpha_earth_dir}")
+        return
+
+    print(f"Found {len(alpha_earth_files)} Alpha Earth files")
+    print(f"Processing with tile size: {args.tile_size}x{args.tile_size}")
+
+    total_tiles = 0
+    for alpha_file in alpha_earth_files:
+        print(f"\nProcessing: {alpha_file.name}")
+        try:
+            tile_count = tiler.create_tiles(
+                str(alpha_file),
+                args.gedi_file,
+                args.output_dir,
+                save_embeddings_as_npy=not args.save_embeddings_as_tif
+            )
+            total_tiles += tile_count
+        except Exception as e:
+            print(f"Error processing {alpha_file.name}: {e}")
+
+    print(f"\n{'=' * 60}")
+    print(f"Total tiles created: {total_tiles}")
+    print(f"Output directory: {args.output_dir}")
+    if args.save_embeddings_as_tif:
+        print(f"  - Input tiles (TIF): {args.output_dir}/input_tiles/")
+    else:
+        print(f"  - Input tiles (NPY, dequantized): {args.output_dir}/input_tiles/")
+        print(f"  - First 3 tiles also saved as TIF for QGIS verification")
+    print(f"  - Target tiles (TIF): {args.output_dir}/target_tiles/")
+
+
+if __name__ == '__main__':
+    main()
