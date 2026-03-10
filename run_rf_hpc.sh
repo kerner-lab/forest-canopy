@@ -21,10 +21,6 @@ cd /home/kdoerkse/code/jpl-bio
 # Run memory-efficient version with smaller batch size
 mamba run -n jpl python -u simple_random_forest_hpc.py \
     --root_dir /data/hkerner/kdoerkse/jpl-bio/tiles \
-    --save_dir /home/kdoerkse/scratch-results-jpl \
-    --batch_size 50 \
-    --n_estimators 100 \
-    --max_depth 20 \
-    --n_jobs 10
+    --save_dir /home/kdoerkse/scratch-results-jpl
 
 echo "Job completed!"

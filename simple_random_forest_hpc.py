@@ -17,13 +17,6 @@ import gc
 import os
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Tiling results into maps')
-    parser.add_argument('--root_dir', help='Root directory of data')
-    parser.add_argument('--save_dir', help='Directory to save data')
-    return parser.parse_args()
-
-
 def get_tile_list_with_coords(input_dir, target_dir, load_all_folders=False):
     """
     Get list of tile paths with their coordinates without loading data.
@@ -234,15 +227,23 @@ def evaluate_batched(model, tile_list, split_name="", batch_size=100):
 
 
 def main():
-    args = get_args()
-    root_dir = args.root_dir
-    save_dir = args.save_dir
-    INPUT_DIR = "{}/input_tiles".format(root_dir)
-    TARGET_DIR = "{}/target_tiles".format(root_dir)
-    LOAD_ALL_FOLDERS = True
+    parser = argparse.ArgumentParser(description='Memory-efficient Random Forest for HPC')
+    parser.add_argument('--root_dir', type=str, required=True,
+                       help='Root directory containing input_tiles and target_tiles')
+    parser.add_argument('--save_dir', type=str, required=True,
+                       help='Directory to save results')
+    parser.add_argument('--batch_size', type=int, default=50,
+                       help='Batch size for loading data (default: 50)')
+    parser.add_argument('--n_estimators', type=int, default=100,
+                       help='Number of trees (default: 100)')
+    parser.add_argument('--max_depth', type=int, default=20,
+                       help='Max depth of trees (default: 20)')
+    parser.add_argument('--split_lon', type=float, default=None,
+                       help='Split longitude (default: auto-calculate)')
+    parser.add_argument('--n_jobs', type=int, default=-1,
+                       help='Number of parallel jobs (default: -1 = all cores)')
 
-    if not os.path.isdir(save_dir):
-        os.mkdir(save_dir)
+    args = parser.parse_args()
     
     # Setup paths
     root_dir = Path(args.root_dir)
