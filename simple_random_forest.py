@@ -7,6 +7,7 @@ Splits tiles by geography (East vs West):
 
 Flattens embeddings and targets, trains sklearn RandomForestRegressor.
 """
+import os
 
 import numpy as np
 from pathlib import Path
@@ -15,6 +16,13 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import pickle
+import argparse
+
+def get_args():
+    parser = argparse.ArgumentParser(description='Tiling results into maps')
+    parser.add_argument('--root_dir', help='Root directory of data')
+    parser.add_argument('--save_dir', help='Directory to save data')
+    return parser.parse_args()
 
 
 def load_all_alpha_files(base_input_dir, base_target_dir, split_lon=None):
@@ -295,21 +303,17 @@ def load_model(filepath="random_forest_model.pkl"):
     return model
 
 
-# ============================================================================
-# Main Script
-# ============================================================================
 
 if __name__ == "__main__":
-    
-    # OPTION 1: Load from a single alpha earth file
-    # INPUT_DIR = "tiles_output/input_tiles/your_alpha_file"
-    # TARGET_DIR = "tiles_output/target_tiles/your_alpha_file"
-    # LOAD_ALL_FOLDERS = False
-    
-    # OPTION 2: Load from ALL alpha earth files (RECOMMENDED)
-    INPUT_DIR = "tiles_output/input_tiles"
-    TARGET_DIR = "tiles_output/target_tiles"
+    args = get_args()
+    root_dir = args.root_dir
+    save_dir = args.save_dir
+    INPUT_DIR = "{}/input_tiles".format(root_dir)
+    TARGET_DIR = "{}/target_tiles".format(root_dir)
     LOAD_ALL_FOLDERS = True
+
+    if not os.path.isdir(save_dir):
+        os.mkdir(save_dir)
     
     # Geographic bounds of your data:
     # 41.3162° N, 120.1156° W (East) to 41.2778° N, 123.6772° W (West)
@@ -360,7 +364,7 @@ if __name__ == "__main__":
     )
     
     # 4. Save model
-    save_model(model, "random_forest_model.pkl")
+    save_model(model, "{}/random_forest_model.pkl".format(save_dir))
     
     # 5. Summary
     print("\n" + "="*70)
@@ -373,7 +377,7 @@ if __name__ == "__main__":
     
     # Optional: Save predictions
     print("\nSaving predictions...")
-    np.save("train_predictions.npy", train_preds)
-    np.save("val_predictions.npy", val_preds)
-    np.save("test_predictions.npy", test_preds)
+    np.save("{}/train_predictions.npy".format(save_dir), train_preds)
+    np.save("{}/val_predictions.npy".format(save_dir), val_preds)
+    np.save("{}/test_predictions.npy".format(save_dir), test_preds)
     print("✓ Predictions saved")
