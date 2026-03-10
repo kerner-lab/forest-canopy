@@ -15,6 +15,12 @@ import pickle
 import argparse
 import gc
 import os
+import sys
+
+def print_flush(*args, **kwargs):
+    """Print with immediate flush to ensure output appears in logs."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
 
 
 def get_tile_list_with_coords(input_dir, target_dir, load_all_folders=False):
@@ -252,36 +258,36 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    print("="*70)
-    print("Memory-Efficient Random Forest for HPC")
-    print("="*70)
-    print(f"Root dir: {root_dir}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"n_estimators: {args.n_estimators}")
-    print(f"max_depth: {args.max_depth}")
+    print_flush("="*70)
+    print_flush("Memory-Efficient Random Forest for HPC")
+    print_flush("="*70)
+    print_flush(f"Root dir: {root_dir}")
+    print_flush(f"Batch size: {args.batch_size}")
+    print_flush(f"n_estimators: {args.n_estimators}")
+    print_flush(f"max_depth: {args.max_depth}")
     
     # 1. Get tile list (memory efficient)
-    print("\n" + "="*70)
-    print("Step 1: Getting tile list")
-    print("="*70)
+    print_flush("\n" + "="*70)
+    print_flush("Step 1: Getting tile list")
+    print_flush("="*70)
     
     tile_info, all_lons = get_tile_list_with_coords(
         input_dir, target_dir, load_all_folders=True
     )
     
     # 2. Split by geography
-    print("\n" + "="*70)
-    print("Step 2: Splitting by geography")
-    print("="*70)
+    print_flush("\n" + "="*70)
+    print_flush("Step 2: Splitting by geography")
+    print_flush("="*70)
     
     train_tiles, val_tiles, test_tiles = split_tiles_by_longitude(
         tile_info, all_lons, split_lon=args.split_lon
     )
     
     # 3. Train model
-    print("\n" + "="*70)
-    print("Step 3: Training Random Forest")
-    print("="*70)
+    print_flush("\n" + "="*70)
+    print_flush("Step 3: Training Random Forest")
+    print_flush("="*70)
     
     model = train_random_forest_incremental(
         train_tiles, val_tiles,
@@ -309,20 +315,20 @@ def main():
     )
     
     # 5. Save results
-    print("\n" + "="*70)
-    print("Step 5: Saving results")
-    print("="*70)
+    print_flush("\n" + "="*70)
+    print_flush("Step 5: Saving results")
+    print_flush("="*70)
     
     model_path = save_dir / "random_forest_model.pkl"
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
-    print(f"✓ Model saved to {model_path}")
+    print_flush(f"✓ Model saved to {model_path}")
     
     # Save predictions
     np.save(save_dir / "train_predictions.npy", train_preds)
     np.save(save_dir / "val_predictions.npy", val_preds)
     np.save(save_dir / "test_predictions.npy", test_preds)
-    print(f"✓ Predictions saved")
+    print_flush(f"✓ Predictions saved")
     
     # Save metrics
     metrics = {
@@ -333,16 +339,16 @@ def main():
     
     with open(save_dir / "metrics.pkl", 'wb') as f:
         pickle.dump(metrics, f)
-    print(f"✓ Metrics saved")
+    print_flush(f"✓ Metrics saved")
     
     # Summary
-    print("\n" + "="*70)
-    print("Summary")
-    print("="*70)
-    print(f"Train R²: {train_r2:.4f}")
-    print(f"Val R²:   {val_r2:.4f}")
-    print(f"Test R²:  {test_r2:.4f}")
-    print("\n✓ Complete!")
+    print_flush("\n" + "="*70)
+    print_flush("Summary")
+    print_flush("="*70)
+    print_flush(f"Train R²: {train_r2:.4f}")
+    print_flush(f"Val R²:   {val_r2:.4f}")
+    print_flush(f"Test R²:  {test_r2:.4f}")
+    print_flush("\n✓ Complete!")
 
 
 if __name__ == "__main__":
