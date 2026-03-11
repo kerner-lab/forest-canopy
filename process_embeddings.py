@@ -4,7 +4,6 @@ Script to tile Alpha Earth TIF files and match them with GEDI data.
 Creates 224x224 tiles with spatial alignment between input and target data.
 """
 
-import os
 import numpy as np
 from osgeo import gdal, osr
 from pathlib import Path
@@ -259,9 +258,7 @@ class GeoTiffTiler:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Tile Alpha Earth files and match with GEDI data'
-    )
+    parser = argparse.ArgumentParser(description='Tile Alpha Earth files and match with GEDI data')
     parser.add_argument('--alpha-earth-dir', required=True,
                         help='Directory containing Alpha Earth TIF files')
     parser.add_argument('--gedi-file', required=True,
