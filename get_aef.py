@@ -1,80 +1,82 @@
 """
-Grabbing AEF data
+Load parts of AEF embeddings via xarray
 """
+
+import time
+import warnings
+import numpy as np
+import xarray as xr
+import zarr
+import zarr.storage
+from zarr.errors import ZarrUserWarning
+import rasterix
+from rasterix import RasterIndex
+from affine import Affine
+from pyproj import CRS
 import geopandas as gpd
-import pandas as pd
-import subprocess
-import os
-import requests
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
 
-# Setup data dir and read parquet
-data_dir = '/Users/kdoerkse/Documents/ASU/JPL/data'
-index = gpd.read_parquet("{}/aef_index.parquet".format(data_dir))
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
-"""
-# Full California Bounding Box
-california = index[
-    (index["year"] == 2019) &
-    (index["wgs84_north"] > 32) &
-    (index["wgs84_south"] < 42) &
-    (index["wgs84_east"] > -124) &
-    (index["wgs84_west"] < -114)
-]
+# gets rid of a bunch of warnings like "ZarrUserWarning: Object at .checkpoint.2018.json is not recognized as a component of a Zarr hierarchy."
+warnings.filterwarnings("ignore", category=ZarrUserWarning)
 
-print(f"Found {len(california)} tiles")
-print(california["utm_zone"].value_counts())
 
-# Save the list of file paths
-california.to_csv("{}/california_2019_tiles.csv".format(data_dir), index=False)
-"""
+STORE_URL = "s3://us-west-2.opendata.source.coop/tge-labs/aef-mosaic"
 
-california = pd.read_csv("{}/california_2019_tiles.csv".format(data_dir))
+def open_aef_mosaic():
+    tic = time.time()
 
-# Filtering out for Northern California for first run
-california = index[
-    (index["year"] == 2019) &
-    (index["wgs84_north"] > 37.5) &   # NorCal cutoff ~ SF latitude
-    (index["wgs84_south"] < 42) &      # CA northern border
-    (index["wgs84_east"] > -124) &
-    (index["wgs84_west"] < -114)
-]
+    store = zarr.storage.FsspecStore.from_url(
+        STORE_URL,
+        storage_options={"anon": True},
+        read_only=True,
+    )
+    ds = xr.open_zarr(store, zarr_format=3, consolidated=False)
 
-print(f"Downloading {len(california)} tiles...")
+    print(f" Opened in {time.time() - tic:.2f}s")
+    return ds
 
-def download_tile(row):
-    s3_tiff = row["path"]
-    s3_vrt = s3_tiff.replace(".tiff", ".vrt")
-    out_dir = os.path.join(data_dir, "norcal_2019", row["utm_zone"])
-    os.makedirs(out_dir, exist_ok=True)
+def assign_rasterix_index(ds):
+    attrs = ds["embeddings"].attrs
+    affine = Affine(*attrs["spatial:transform"])
+    crs = CRS.from_user_input(attrs["proj:code"])
+    height, width = attrs["spatial:shape"]
 
-    for s3_path in [s3_tiff, s3_vrt]:
-        fname = os.path.basename(s3_path)
-        out_path = os.path.join(out_dir, fname)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            print(f"Skipping (already exists): {fname}")
-            continue
+    raster_idx = RasterIndex.from_transform(
+        affine, width=width, height=height,
+        x_dim="x", y_dim="y", crs=crs,
+    )
 
-        https_url = s3_path.replace(
-            "s3://us-west-2.opendata.source.coop",
-            "https://data.source.coop"
-        )
+    emb = ds["embeddings"].drop_vars(["x", "y"], errors="ignore")
+    emb = emb.assign_coords(raster_idx.create_variables())
+    return emb
 
-        with requests.get(https_url, stream=True) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(out_path, "wb") as f, tqdm(
-                total=total, unit="B", unit_scale=True,
-                unit_divisor=1024, desc=fname
-            ) as bar:
-                for chunk in r.iter_content(chunk_size=1024*1024):
-                    f.write(chunk)
-                    bar.update(len(chunk))
+ds = open_aef_mosaic()
+embedding_ds = assign_rasterix_index(ds)
 
-print(f"Downloading {len(california)} tiles...")
-rows = [row for _, row in california.iterrows()]
-with ThreadPoolExecutor(max_workers=4) as executor:
-    executor.map(download_tile, rows)
+# Load the boundaries from the gedi file
+gedi_bound = gpd.read_file('/Users/kdoerkse/Documents/ASU/JPL/data/gedi_tiles_2021/tile_index/tile_index.geojson')
+minx, miny, maxx, maxy = gedi_bound.total_bounds
 
-print("Done!")
+t0 = time.time()
+subset = embedding_ds.sel(
+    x=slice(minx, maxx),
+    y=slice(maxy, miny),
+    time=2021
+)
+
+import ipdb
+ipdb.set_trace()
+
+data = subset.compute().values
+
+
+
+
+
+
+
+
+
+
