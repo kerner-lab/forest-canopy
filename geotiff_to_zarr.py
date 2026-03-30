@@ -118,15 +118,15 @@ def geotiff_to_zarr_int8(geotiff_path, zarr_output_path, healpix_id):
     # Zarr filename with int8 suffix
     zarr_file = zarr_output_path / f"healpix_{healpix_id}_embeddings_int8.zarr"
 
-    # Save to Zarr with compression (Zarr v3 compatible)
+    # Save to Zarr with compression
     z = zarr.open(
         str(zarr_file),
         mode='w',
         shape=data_int8.shape,
         chunks=(1, 256, 256),
         dtype=np.int8,
-        zarr_format=2,  # Use Zarr v2 format
-        compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=zarr.Blosc.BITSHUFFLE)
+        zarr_format=2,
+        compressor=Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)  # CHANGE zarr.Blosc to Blosc
     )
     z[:] = data_int8
 
