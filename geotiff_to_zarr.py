@@ -2,6 +2,7 @@
 """
 Convert rslearn GeoTIFF embeddings to compressed Zarr format.
 Creates both float32 (lossless) and int8 (quantized) versions.
+Compatible with Zarr v3.
 """
 
 import zarr
@@ -10,11 +11,9 @@ import numpy as np
 import json
 import argparse
 from pathlib import Path
-from numcodecs import Blosc
-import shutil
 
 
-def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id, compressor='blosc'):
+def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id):
     """
     Convert GeoTIFF to compressed Zarr (float32, lossless).
 
@@ -38,12 +37,6 @@ def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id, compress
             'bounds': list(src.bounds)
         }
 
-    # Create compressor
-    if compressor == 'blosc':
-        comp = Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)
-    else:
-        comp = None
-
     # Create output directory
     zarr_output_path = Path(zarr_output_path)
     zarr_output_path.mkdir(parents=True, exist_ok=True)
@@ -51,14 +44,16 @@ def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id, compress
     # Zarr filename with float32 suffix
     zarr_file = zarr_output_path / f"healpix_{healpix_id}_embeddings_float32.zarr"
 
-    # Save to Zarr with compression
+    # Save to Zarr with compression (Zarr v3 compatible)
+    # Use zarr_format=2 for compatibility
     z = zarr.open(
         str(zarr_file),
         mode='w',
         shape=data.shape,
-        chunks=(1, 256, 256),  # One band per chunk, 256x256 spatial
+        chunks=(1, 256, 256),
         dtype=data.dtype,
-        compressor=comp
+        zarr_format=2,  # Use Zarr v2 format for compatibility
+        compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=zarr.Blosc.BITSHUFFLE)
     )
     z[:] = data
 
@@ -73,7 +68,7 @@ def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id, compress
     return str(zarr_file), compression_ratio, original_size_mb, zarr_size_mb, metadata
 
 
-def geotiff_to_zarr_int8(geotiff_path, zarr_output_path, healpix_id, compressor='blosc'):
+def geotiff_to_zarr_int8(geotiff_path, zarr_output_path, healpix_id):
     """
     Convert GeoTIFF to compressed Zarr (int8 quantized).
 
@@ -123,12 +118,6 @@ def geotiff_to_zarr_int8(geotiff_path, zarr_output_path, healpix_id, compressor=
         'shape': list(data_int8.shape)
     }
 
-    # Create compressor
-    if compressor == 'blosc':
-        comp = Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)
-    else:
-        comp = None
-
     # Create output directory
     zarr_output_path = Path(zarr_output_path)
     zarr_output_path.mkdir(parents=True, exist_ok=True)
@@ -136,14 +125,15 @@ def geotiff_to_zarr_int8(geotiff_path, zarr_output_path, healpix_id, compressor=
     # Zarr filename with int8 suffix
     zarr_file = zarr_output_path / f"healpix_{healpix_id}_embeddings_int8.zarr"
 
-    # Save to Zarr with compression
+    # Save to Zarr with compression (Zarr v3 compatible)
     z = zarr.open(
         str(zarr_file),
         mode='w',
         shape=data_int8.shape,
         chunks=(1, 256, 256),
         dtype=np.int8,
-        compressor=comp
+        zarr_format=2,  # Use Zarr v2 format
+        compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=zarr.Blosc.BITSHUFFLE)
     )
     z[:] = data_int8
 
@@ -163,18 +153,6 @@ def process_tile_embeddings(dataset_path, tile_name, zarr_output_path, healpix_i
     """
     Process all embedding GeoTIFFs for a tile.
     Creates both float32 and int8 Zarr versions.
-
-    Args:
-        dataset_path: rslearn dataset root path
-        tile_name: Name of the tile (e.g., 'tile_0')
-        zarr_output_path: Output directory for Zarr files
-        healpix_id: HEALPix tile ID
-        create_float32: Create float32 Zarr (lossless)
-        create_int8: Create int8 Zarr (quantized)
-        delete_geotiff: Whether to delete original GeoTIFF after conversion
-
-    Returns:
-        dict: Statistics about the conversion
     """
 
     embeddings_path = Path(dataset_path) / "windows" / tile_name / tile_name / "layers" / "embeddings"
