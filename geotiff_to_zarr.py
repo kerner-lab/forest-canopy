@@ -2,7 +2,6 @@
 """
 Convert rslearn GeoTIFF embeddings to compressed Zarr format.
 Creates both float32 (lossless) and int8 (quantized) versions.
-Compatible with Zarr v3.
 """
 
 import zarr
@@ -11,23 +10,20 @@ import numpy as np
 import json
 import argparse
 from pathlib import Path
+from numcodecs import Blosc
 
 
 def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id):
     """
     Convert GeoTIFF to compressed Zarr (float32, lossless).
-
-    Returns:
-        tuple: (zarr_path, compression_ratio, original_size_mb, zarr_size_mb, metadata)
     """
 
     # Read GeoTIFF
     with rasterio.open(geotiff_path) as src:
-        data = src.read()  # Shape: (bands, height, width)
+        data = src.read()
         transform = src.transform
         crs = src.crs
 
-        # Save metadata
         metadata = {
             'healpix_id': healpix_id,
             'transform': list(transform),
@@ -37,23 +33,20 @@ def geotiff_to_zarr_float32(geotiff_path, zarr_output_path, healpix_id):
             'bounds': list(src.bounds)
         }
 
-    # Create output directory
     zarr_output_path = Path(zarr_output_path)
     zarr_output_path.mkdir(parents=True, exist_ok=True)
 
-    # Zarr filename with float32 suffix
     zarr_file = zarr_output_path / f"healpix_{healpix_id}_embeddings_float32.zarr"
 
-    # Save to Zarr with compression (Zarr v3 compatible)
-    # Use zarr_format=2 for compatibility
+    # Save to Zarr - CORRECTED LINE
     z = zarr.open(
         str(zarr_file),
         mode='w',
         shape=data.shape,
         chunks=(1, 256, 256),
         dtype=data.dtype,
-        zarr_format=2,  # Use Zarr v2 format for compatibility
-        compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=zarr.Blosc.BITSHUFFLE)
+        zarr_format=2,
+        compressor=Blosc(cname='zstd', clevel=5, shuffle=Blosc.BITSHUFFLE)  # FIXED
     )
     z[:] = data
 
