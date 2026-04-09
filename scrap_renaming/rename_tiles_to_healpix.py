@@ -217,7 +217,7 @@ def main():
     EMBEDDINGS_DIR = "/scratch/kdoerkse/olmo/california_embeddings_zarr"
 
     # Set to False to actually perform the renaming
-    DRY_RUN = True
+    DRY_RUN = False
 
     # Optional: Check specific indices for verification
     CHECK_INDICES = [0, 1, 2, 171, 310]  # Add indices you want to verify
