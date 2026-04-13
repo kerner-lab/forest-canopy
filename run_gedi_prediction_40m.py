@@ -155,7 +155,13 @@ class GEDIPredictor:
 
         # Load zarr array
         try:
-            z = zarr.open(str(emb_path), mode='r')
+            # Try opening as a group first, then as an array
+            try:
+                z = zarr.open(str(emb_path), mode='r')
+            except Exception:
+                # If group fails, try as array
+                z = zarr.open_array(str(emb_path), mode='r')
+
             embeddings = np.array(z)
 
             # Transpose from (C, H, W) to (H, W, C) if needed
@@ -194,7 +200,13 @@ class GEDIPredictor:
         emb_path = self.embeddings_dir / f"healpix_{healpix_id}_embeddings_int8.zarr"
         if emb_path.exists():
             try:
-                z = zarr.open(str(emb_path), mode='r')
+                # Try opening as a group first, then as an array
+                try:
+                    z = zarr.open(str(emb_path), mode='r')
+                except Exception:
+                    # If group fails, try as array
+                    z = zarr.open_array(str(emb_path), mode='r')
+
                 attrs = dict(z.attrs)
                 if 'transform' in attrs and 'crs' in attrs:
                     return attrs
@@ -253,7 +265,21 @@ class GEDIPredictor:
                     resampling=Resampling.bilinear
                 )
 
-                self.logger.info(f"Warped GEDI from {src.crs} {src.shape} to {target_crs} {gedi_warped.shape}")
+                # Debug: Check values before conversion
+                valid_before = gedi_warped[np.isfinite(gedi_warped) & (gedi_warped != 0)]
+                if len(valid_before) > 0:
+                    self.logger.info(f"Before cm→m: min={np.min(valid_before):.1f}, max={np.max(valid_before):.1f}")
+
+                # Convert from centimeters to meters
+                gedi_warped = gedi_warped / 100.0
+
+                # Debug: Check values after conversion
+                valid_after = gedi_warped[np.isfinite(gedi_warped) & (gedi_warped != 0)]
+                if len(valid_after) > 0:
+                    self.logger.info(f"After cm→m: min={np.min(valid_after):.2f}, max={np.max(valid_after):.2f}")
+
+                self.logger.info(
+                    f"Warped GEDI from {src.crs} {src.shape} to {target_crs} {gedi_warped.shape} (converted cm→m)")
                 return gedi_warped
 
         except Exception as e:
@@ -350,7 +376,13 @@ class GEDIPredictor:
 
         print(f"  ✓ GEDI warped to match OLMo: {gedi_data.shape}")
 
-        # Create mask for valid GEDI data
+        # Debug: Check data range before filtering
+        gedi_valid = gedi_data[np.isfinite(gedi_data)]
+        if len(gedi_valid) > 0:
+            print(f"  GEDI range before filtering: [{np.min(gedi_valid):.2f}, {np.max(gedi_valid):.2f}] meters")
+
+        # Create mask for valid GEDI data (in meters)
+        # Reasonable canopy height: 0-100 meters
         valid_mask = np.isfinite(gedi_data) & (gedi_data > 0)
 
         # Flatten data
