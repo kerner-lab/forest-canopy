@@ -32,7 +32,8 @@ from tqdm import tqdm
 import json
 import logging
 from datetime import datetime
-
+from rasterio.transform import rowcol
+from rasterio.warp import transform as transform_coords
 
 class GEDIPredictor:
     """Pipeline for GEDI canopy height prediction using OLMo embeddings"""
@@ -247,10 +248,13 @@ class GEDIPredictor:
         xs_proj, ys_proj = transform_coords('EPSG:4326', target_crs, xs, ys)
 
         # 4. Map to OLMo Pixel Grid
+        from rasterio.transform import rowcol
         olmo_transform = Affine(*meta['transform'][:6])
-        olmo_cols, olmo_rows = ~olmo_transform * (xs_proj, ys_proj)
-        olmo_cols = np.floor(olmo_cols).astype(int)
-        olmo_rows = np.floor(olmo_rows).astype(int)
+
+        # rowcol handles the sequences (lists) correctly
+        olmo_rows, olmo_cols = rowcol(olmo_transform, xs_proj, ys_proj)
+        olmo_rows = np.array(olmo_rows)
+        olmo_cols = np.array(olmo_cols)
 
         # 5. Filter for bounds
         h, w, c = embeddings.shape
