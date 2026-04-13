@@ -216,185 +216,76 @@ class GEDIPredictor:
         self.logger.warning(f"No metadata found for tile {healpix_id}")
         return None
 
-    def load_gedi_warped_to_olmo(self, healpix_id, target_shape, target_transform, target_crs):
-        """
-        Load GEDI and warp to match OLMo's grid
-
-        Args:
-            healpix_id: The healpix tile ID
-            target_shape: Target shape (H, W) from OLMo
-            target_transform: Affine transform from OLMo metadata
-            target_crs: CRS from OLMo metadata
-
-        Returns:
-            Warped GEDI array or None
-        """
-        # Find GEDI file
-        gedi_path = None
-        for ext in ['.tif', '.tiff', '']:
-            test_path = self.gedi_dir / f"healpix_{healpix_id}_gedi{ext}"
-            if test_path.exists():
-                gedi_path = test_path
-                break
-
-        if gedi_path is None:
-            self.logger.warning(f"GEDI file not found for tile {healpix_id}")
-            return None
-
-        try:
-            from affine import Affine
-
-            with rasterio.open(gedi_path) as src:
-                # Create output array at target shape
-                gedi_warped = np.empty(target_shape, dtype=np.float32)
-
-                # Build affine transform from target_transform list
-                if isinstance(target_transform, list):
-                    target_affine = Affine(*target_transform[:6])
-                else:
-                    target_affine = target_transform
-
-                # Reproject GEDI to match OLMo's grid
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=gedi_warped,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=target_affine,
-                    dst_crs=target_crs,
-                    resampling=Resampling.bilinear
-                )
-
-                # Debug: Check values before conversion
-                valid_before = gedi_warped[np.isfinite(gedi_warped) & (gedi_warped != 0)]
-                if len(valid_before) > 0:
-                    self.logger.info(f"Before cm→m: min={np.min(valid_before):.1f}, max={np.max(valid_before):.1f}")
-
-                # Convert from centimeters to meters
-                gedi_warped = gedi_warped / 100.0
-
-                # Debug: Check values after conversion
-                valid_after = gedi_warped[np.isfinite(gedi_warped) & (gedi_warped != 0)]
-                if len(valid_after) > 0:
-                    self.logger.info(f"After cm→m: min={np.min(valid_after):.2f}, max={np.max(valid_after):.2f}")
-
-                self.logger.info(
-                    f"Warped GEDI from {src.crs} {src.shape} to {target_crs} {gedi_warped.shape} (converted cm→m)")
-                return gedi_warped
-
-        except Exception as e:
-            self.logger.error(f"Error warping GEDI for tile {healpix_id}: {e}")
-            return None
-
-    def resample_embeddings_to_gedi(self, embeddings, gedi_shape):
-        """
-        Resample embeddings from 10m to 30m resolution to match GEDI
-
-        Args:
-            embeddings: numpy array of shape (H, W, C) at 10m resolution
-            gedi_shape: target shape (H', W') at 30m resolution
-
-        Returns:
-            Resampled embeddings of shape (H', W', C)
-        """
-        # Since 30m/10m = 3, we expect roughly 1/3 the dimensions
-        # Use block averaging (mean pooling) to downsample
-
-        h_emb, w_emb, n_channels = embeddings.shape
-        h_gedi, w_gedi = gedi_shape
-
-        # Calculate the scaling factors
-        scale_h = h_emb / h_gedi
-        scale_w = w_emb / w_gedi
-
-        # Use block averaging for downsampling
-        resampled = np.zeros((h_gedi, w_gedi, n_channels), dtype=np.float32)
-
-        for i in range(h_gedi):
-            for j in range(w_gedi):
-                # Define the block in the high-res embeddings
-                i_start = int(i * scale_h)
-                i_end = int((i + 1) * scale_h)
-                j_start = int(j * scale_w)
-                j_end = int((j + 1) * scale_w)
-
-                # Average over the block
-                resampled[i, j, :] = embeddings[i_start:i_end, j_start:j_end, :].mean(axis=(0, 1))
-
-        return resampled
-
-    def prepare_tile_data(self, healpix_id):
-        """
-        Prepare training data for a single tile (with CRS handling)
-
-        This version handles the mismatch between:
-        - OLMo: 40m UTM (EPSG:32610)
-        - GEDI: 30m lat/lon (EPSG:4326)
-
-        Args:
-            healpix_id: The healpix tile ID
-
-        Returns:
-            tuple: (X, y) where X is features and y is GEDI heights
-                   Returns (None, None) if data cannot be loaded
-        """
-        # Load OLMo embeddings first
-        embeddings = self.load_embeddings_tile(healpix_id)
-        if embeddings is None:
-            self.skipped_tiles.append((healpix_id, 'missing_embeddings'))
-            self.logger.info(f"Skipping tile {healpix_id}: OLMo embeddings not available")
+    def prepare_tile_data(self, healpix_id, zero_fraction=0.1):
+        # 1. Load Embeddings and Metadata
+        embeddings = self.load_embeddings_tile(healpix_id)  # (H, W, 128)
+        meta = self.load_embeddings_metadata(healpix_id)
+        if embeddings is None or meta is None:
             return None, None
 
-        # Load OLMo metadata to get grid parameters
-        metadata = self.load_embeddings_metadata(healpix_id)
-        if metadata is None:
-            self.skipped_tiles.append((healpix_id, 'missing_metadata'))
-            self.logger.warning(f"Skipping tile {healpix_id}: No metadata found")
-            return None, None
+        # 2. Load GEDI TIFF
+        gedi_path = next(self.gedi_dir.glob(f"healpix_{healpix_id}_gedi*"), None)
+        if gedi_path is None: return None, None
 
-        # Extract grid parameters from metadata
-        target_shape = embeddings.shape[:2]  # (H, W)
-        target_transform = metadata.get('transform')
-        target_crs = metadata.get('crs', 'EPSG:32610')
+        with rasterio.open(gedi_path) as src:
+            gedi_raw = src.read(1)
 
-        self.logger.info(f"Tile {healpix_id} - OLMo grid: {target_shape}, CRS: {target_crs}")
-        print(f"  OLMo grid: {target_shape}, CRS: {target_crs}")
+            # NEW MASK: Include 0, but exclude NoData (-9999) and extreme outliers
+            mask = (gedi_raw != -9999) & (gedi_raw < 12000)
 
-        # Load and warp GEDI to match OLMo's grid
-        gedi_data = self.load_gedi_warped_to_olmo(healpix_id, target_shape, target_transform, target_crs)
-        if gedi_data is None:
-            self.skipped_tiles.append((healpix_id, 'missing_gedi'))
-            self.logger.info(f"Skipping tile {healpix_id}: GEDI data not available")
-            return None, None
+            rows, cols = np.where(mask)
+            if len(rows) == 0: return None, None
 
-        # Verify shapes match
-        if gedi_data.shape != embeddings.shape[:2]:
-            self.logger.error(
-                f"Shape mismatch for tile {healpix_id}: GEDI {gedi_data.shape} vs OLMo {embeddings.shape[:2]}")
-            self.skipped_tiles.append((healpix_id, 'shape_mismatch'))
-            return None, None
+            # Get Lat/Lon (EPSG:4326) and convert cm to m
+            xs, ys = rasterio.transform.xy(src.transform, rows, cols)
+            # np.maximum(..., 0) clips small sensor noise (like -0.05m) to flat ground
+            y_all = np.maximum(gedi_raw[mask] / 100.0, 0)
 
-        print(f"  ✓ GEDI warped to match OLMo: {gedi_data.shape}")
+        # 3. Coordinate Sync: Transform GEDI (4326) -> OLMo (UTM)
+        from rasterio.warp import transform as transform_coords
+        target_crs = meta.get('crs', 'EPSG:32610')
+        xs_proj, ys_proj = transform_coords('EPSG:4326', target_crs, xs, ys)
 
-        # Debug: Check data range before filtering
-        gedi_valid = gedi_data[np.isfinite(gedi_data)]
-        if len(gedi_valid) > 0:
-            print(f"  GEDI range before filtering: [{np.min(gedi_valid):.2f}, {np.max(gedi_valid):.2f}] meters")
+        # 4. Map to OLMo Pixel Grid
+        olmo_transform = Affine(*meta['transform'][:6])
+        olmo_cols, olmo_rows = ~olmo_transform * (xs_proj, ys_proj)
+        olmo_cols = np.floor(olmo_cols).astype(int)
+        olmo_rows = np.floor(olmo_rows).astype(int)
 
-        # Create mask for valid GEDI data (in meters)
-        # Reasonable canopy height: 0-100 meters
-        valid_mask = np.isfinite(gedi_data) & (gedi_data > 0)
-
-        # Flatten data
-        y = gedi_data[valid_mask]
-
-        # Reshape embeddings and filter by mask
+        # 5. Filter for bounds
         h, w, c = embeddings.shape
-        X = embeddings.reshape(-1, c)[valid_mask.flatten()]
+        valid_bounds = (olmo_rows >= 0) & (olmo_rows < h) & (olmo_cols >= 0) & (olmo_cols < w)
 
-        valid_pct = 100 * len(y) / gedi_data.size
-        print(f"  Valid pixels: {len(y)} out of {gedi_data.size} ({valid_pct:.2f}%)")
-        self.logger.info(f"Tile {healpix_id}: {len(y)} valid pixels ({valid_pct:.2f}%)")
+        y_final = y_all[valid_bounds]
+        X_final = embeddings[olmo_rows[valid_bounds], olmo_cols[valid_bounds], :]
+
+        # 6. STRATIFIED BALANCING (The Fix for the "Mean" Problem)
+        is_tree = y_final > 1.0  # Trees are taller than 1m
+        is_ground = y_final <= 1.0  # Ground/Grass is < 1m
+
+        # Keep all the trees
+        X_trees = X_final[is_tree]
+        y_trees = y_final[is_tree]
+
+        # Keep only a fraction of the ground points
+        X_ground = X_final[is_ground]
+        y_ground = y_final[is_ground]
+
+        if len(y_ground) > 0:
+            num_to_keep = int(len(y_ground) * zero_fraction)
+            idx = np.random.choice(len(y_ground), num_to_keep, replace=False)
+            X_ground = X_ground[idx]
+            y_ground = y_ground[idx]
+
+        # Combine back together
+        X = np.vstack([X_trees, X_ground])
+        y = np.concatenate([y_trees, y_ground])
+
+        from scipy.stats import spearmanr
+        # Check correlation of the first 5 embedding channels with height
+        for i in range(5):
+            corr, _ = spearmanr(X[:, i], y)
+            print(f"Channel {i} Correlation: {corr:.3f}")
 
         return X, y
 
@@ -436,6 +327,10 @@ class GEDIPredictor:
         X = np.vstack(X_list)
         y = np.concatenate(y_list)
 
+        from scipy.stats import spearmanr
+        corr, _ = spearmanr(X[:, 0], y)  # Check correlation with the first embedding channel
+        print(f"DEBUG: Initial Spearman Correlation between Feature 0 and Height: {corr:.3f}")
+
         loaded_tiles = len(X_list)
         total_tiles = len(tiles)
 
@@ -448,6 +343,7 @@ class GEDIPredictor:
         self.logger.info(f"{split_name} data: {X.shape[0]} samples, {X.shape[1]} features")
         self.logger.info(f"Successfully loaded: {loaded_tiles}/{total_tiles} tiles")
         self.logger.info(f"Skipped: {skipped_this_split} tiles")
+
 
         return X, y
 
