@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-ML Model for GEDI Canopy Height Prediction using OLMo-Earth Embeddings
+Random Forest Model for GEDI Canopy Height Prediction using OLMo-Earth Embeddings
+
+QUICK FIX VERSION - Handles CRS Mismatch
 
 This script:
 1. Reads healpix shapefile to get train/val/test splits
-2. Loads GEDI data (30m resolution) and OLMo embeddings (10m resolution)
-3. Handles resolution mismatch by resampling embeddings to match GEDI
-4. Filters sparse/invalid GEDI data
-5. Trains a Random Forest model (default)
-6. Evaluates on validation and test sets
+2. Loads GEDI data (~30m resolution, EPSG:4326) and OLMo embeddings (40m resolution, EPSG:32610)
+3. Warps GEDI on-the-fly to match OLMo's UTM grid (handles CRS + resolution mismatch)
+4. Transposes OLMo from (C,H,W) to (H,W,C)
+5. Filters sparse/invalid GEDI data
+6. Trains a Random Forest model
+7. Evaluates on validation and test sets
+
+NOTE: This is a temporary solution. For production, regenerate OLMo embeddings at proper
+resolution and reproject GEDI to UTM permanently.
 """
 
 import numpy as np
@@ -16,6 +22,7 @@ import pandas as pd
 import geopandas as gpd
 import rasterio
 from rasterio.warp import reproject, Resampling
+from affine import Affine
 import zarr
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
@@ -149,17 +156,108 @@ class GEDIPredictor:
         # Load zarr array
         try:
             z = zarr.open(str(emb_path), mode='r')
-
-            # Convert to numpy and handle int8 -> float
-            # Assuming int8 is scaled, typical range [-128, 127] -> normalize
             embeddings = np.array(z)
+
+            # Transpose from (C, H, W) to (H, W, C) if needed
+            if len(embeddings.shape) == 3 and embeddings.shape[0] == 128:
+                self.logger.info(f"Transposing embeddings {healpix_id}: {embeddings.shape}")
+                embeddings = np.transpose(embeddings, (1, 2, 0))
+                self.logger.info(f"  New shape: {embeddings.shape}")
+
+            # Convert to float and normalize
             embeddings = embeddings.astype(np.float32) / 127.0  # Normalize to [-1, 1]
 
-            self.logger.info(f"Loaded embeddings for tile {healpix_id}: shape {embeddings.shape}")
             return embeddings
         except Exception as e:
             self.logger.error(f"Error loading embeddings for tile {healpix_id}: {e}")
             self.missing_embeddings.append(healpix_id)
+            return None
+
+    def load_embeddings_metadata(self, healpix_id):
+        """
+        Load metadata for OLMo embeddings tile
+
+        Args:
+            healpix_id: The healpix tile ID
+
+        Returns:
+            dict with transform, crs, shape, bounds or None
+        """
+        # Try metadata JSON file first
+        metadata_path = self.embeddings_dir / f"healpix_{healpix_id}_metadata.json"
+
+        if metadata_path.exists():
+            with open(metadata_path) as f:
+                return json.load(f)
+
+        # Try zarr attributes
+        emb_path = self.embeddings_dir / f"healpix_{healpix_id}_embeddings_int8.zarr"
+        if emb_path.exists():
+            try:
+                z = zarr.open(str(emb_path), mode='r')
+                attrs = dict(z.attrs)
+                if 'transform' in attrs and 'crs' in attrs:
+                    return attrs
+            except:
+                pass
+
+        self.logger.warning(f"No metadata found for tile {healpix_id}")
+        return None
+
+    def load_gedi_warped_to_olmo(self, healpix_id, target_shape, target_transform, target_crs):
+        """
+        Load GEDI and warp to match OLMo's grid
+
+        Args:
+            healpix_id: The healpix tile ID
+            target_shape: Target shape (H, W) from OLMo
+            target_transform: Affine transform from OLMo metadata
+            target_crs: CRS from OLMo metadata
+
+        Returns:
+            Warped GEDI array or None
+        """
+        # Find GEDI file
+        gedi_path = None
+        for ext in ['.tif', '.tiff', '']:
+            test_path = self.gedi_dir / f"healpix_{healpix_id}_gedi{ext}"
+            if test_path.exists():
+                gedi_path = test_path
+                break
+
+        if gedi_path is None:
+            self.logger.warning(f"GEDI file not found for tile {healpix_id}")
+            return None
+
+        try:
+            from affine import Affine
+
+            with rasterio.open(gedi_path) as src:
+                # Create output array at target shape
+                gedi_warped = np.empty(target_shape, dtype=np.float32)
+
+                # Build affine transform from target_transform list
+                if isinstance(target_transform, list):
+                    target_affine = Affine(*target_transform[:6])
+                else:
+                    target_affine = target_transform
+
+                # Reproject GEDI to match OLMo's grid
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=gedi_warped,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=target_affine,
+                    dst_crs=target_crs,
+                    resampling=Resampling.bilinear
+                )
+
+                self.logger.info(f"Warped GEDI from {src.crs} {src.shape} to {target_crs} {gedi_warped.shape}")
+                return gedi_warped
+
+        except Exception as e:
+            self.logger.error(f"Error warping GEDI for tile {healpix_id}: {e}")
             return None
 
     def resample_embeddings_to_gedi(self, embeddings, gedi_shape):
@@ -201,7 +299,11 @@ class GEDIPredictor:
 
     def prepare_tile_data(self, healpix_id):
         """
-        Prepare training data for a single tile
+        Prepare training data for a single tile (with CRS handling)
+
+        This version handles the mismatch between:
+        - OLMo: 40m UTM (EPSG:32610)
+        - GEDI: 30m lat/lon (EPSG:4326)
 
         Args:
             healpix_id: The healpix tile ID
@@ -210,36 +312,53 @@ class GEDIPredictor:
             tuple: (X, y) where X is features and y is GEDI heights
                    Returns (None, None) if data cannot be loaded
         """
-        # Load GEDI data
-        gedi_data, transform, crs = self.load_gedi_tile(healpix_id)
-        if gedi_data is None:
-            self.skipped_tiles.append((healpix_id, 'missing_gedi'))
-            return None, None
-
-        # Load embeddings
+        # Load OLMo embeddings first
         embeddings = self.load_embeddings_tile(healpix_id)
         if embeddings is None:
             self.skipped_tiles.append((healpix_id, 'missing_embeddings'))
-            self.logger.info(f"Skipping tile {healpix_id}: OLMo embeddings not available (still processing)")
+            self.logger.info(f"Skipping tile {healpix_id}: OLMo embeddings not available")
             return None, None
 
-        # Resample embeddings to match GEDI resolution
-        print(f"  Resampling embeddings from {embeddings.shape[:2]} to {gedi_data.shape}")
-        self.logger.info(
-            f"Resampling embeddings for tile {healpix_id} from {embeddings.shape[:2]} to {gedi_data.shape}")
-        resampled_embeddings = self.resample_embeddings_to_gedi(embeddings, gedi_data.shape)
+        # Load OLMo metadata to get grid parameters
+        metadata = self.load_embeddings_metadata(healpix_id)
+        if metadata is None:
+            self.skipped_tiles.append((healpix_id, 'missing_metadata'))
+            self.logger.warning(f"Skipping tile {healpix_id}: No metadata found")
+            return None, None
 
-        # Create masks for valid data
-        # GEDI data is sparse - filter out no-data values
-        # Assume no-data is represented by NaN, 0, or negative values
+        # Extract grid parameters from metadata
+        target_shape = embeddings.shape[:2]  # (H, W)
+        target_transform = metadata.get('transform')
+        target_crs = metadata.get('crs', 'EPSG:32610')
+
+        self.logger.info(f"Tile {healpix_id} - OLMo grid: {target_shape}, CRS: {target_crs}")
+        print(f"  OLMo grid: {target_shape}, CRS: {target_crs}")
+
+        # Load and warp GEDI to match OLMo's grid
+        gedi_data = self.load_gedi_warped_to_olmo(healpix_id, target_shape, target_transform, target_crs)
+        if gedi_data is None:
+            self.skipped_tiles.append((healpix_id, 'missing_gedi'))
+            self.logger.info(f"Skipping tile {healpix_id}: GEDI data not available")
+            return None, None
+
+        # Verify shapes match
+        if gedi_data.shape != embeddings.shape[:2]:
+            self.logger.error(
+                f"Shape mismatch for tile {healpix_id}: GEDI {gedi_data.shape} vs OLMo {embeddings.shape[:2]}")
+            self.skipped_tiles.append((healpix_id, 'shape_mismatch'))
+            return None, None
+
+        print(f"  ✓ GEDI warped to match OLMo: {gedi_data.shape}")
+
+        # Create mask for valid GEDI data
         valid_mask = np.isfinite(gedi_data) & (gedi_data > 0)
 
         # Flatten data
         y = gedi_data[valid_mask]
 
-        # Reshape embeddings: (H, W, C) -> (H*W, C), then filter by mask
-        h, w, c = resampled_embeddings.shape
-        X = resampled_embeddings.reshape(-1, c)[valid_mask.flatten()]
+        # Reshape embeddings and filter by mask
+        h, w, c = embeddings.shape
+        X = embeddings.reshape(-1, c)[valid_mask.flatten()]
 
         valid_pct = 100 * len(y) / gedi_data.size
         print(f"  Valid pixels: {len(y)} out of {gedi_data.size} ({valid_pct:.2f}%)")
@@ -488,11 +607,11 @@ class GEDIPredictor:
         skipped_embeddings = [tile_id for tile_id, reason in self.skipped_tiles if reason == 'missing_embeddings']
         skipped_gedi = [tile_id for tile_id, reason in self.skipped_tiles if reason == 'missing_gedi']
 
-        print(f"\nMissing olmo Embeddings: {len(unique_missing_embeddings)} tiles")
+        print(f"\nMissing OLMo Embeddings: {len(unique_missing_embeddings)} tiles")
         if unique_missing_embeddings:
             print(f"  Tile IDs: {sorted(unique_missing_embeddings)}")
             self.logger.warning(
-                f"Missing olmo embeddings for {len(unique_missing_embeddings)} tiles: {sorted(unique_missing_embeddings)}")
+                f"Missing OLMo embeddings for {len(unique_missing_embeddings)} tiles: {sorted(unique_missing_embeddings)}")
 
         print(f"\nMissing GEDI Data: {len(unique_missing_gedi)} tiles")
         if unique_missing_gedi:
