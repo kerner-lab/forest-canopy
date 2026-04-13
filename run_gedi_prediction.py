@@ -232,7 +232,7 @@ class GEDIPredictor:
         # Create masks for valid data
         # GEDI data is sparse - filter out no-data values
         # Assume no-data is represented by NaN, 0, or negative values
-        valid_mask = np.isfinite(gedi_data) & (gedi_data > 0) & (gedi_data < 200)  # reasonable height range
+        valid_mask = np.isfinite(gedi_data) & (gedi_data > 0)
 
         # Flatten data
         y = gedi_data[valid_mask]
