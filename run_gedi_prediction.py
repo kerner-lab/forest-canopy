@@ -22,7 +22,7 @@ from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
-import jsonimport
+import json
 import logging
 from datetime import datetime
 
