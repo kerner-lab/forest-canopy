@@ -23,15 +23,7 @@ for idx in range(start_idx, min(end_idx, len(gdf))):
     tile = gdf.iloc[idx]
     bounds = tile.geometry.bounds
 
-    # Get HEALPix ID
-    healpix_id = None
-    for col in ['HEALPIX', 'healpix', 'ID', 'id', 'PIXEL', 'pixel', 'hp_id', 'NEST', 'nest']:
-        if col in tile.index:
-            healpix_id = str(tile[col])
-            break
-
-    if healpix_id is None:
-        healpix_id = str(idx)
+    healpix_id = tile['healpix_id']  # ← FIXED
 
     tiles_info.append({
         'idx': idx,
