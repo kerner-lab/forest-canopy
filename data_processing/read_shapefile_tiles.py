@@ -23,7 +23,7 @@ for idx in range(start_idx, min(end_idx, len(gdf))):
     tile = gdf.iloc[idx]
     bounds = tile.geometry.bounds
 
-    healpix_id = tile['healpix_id']  # ← FIXED
+    healpix_id = str(tile['healpix_id'])
 
     tiles_info.append({
         'idx': idx,
