@@ -56,27 +56,35 @@ with rasterio.open(GEDI_TILE) as gedi:
 print()
 
 # =============================================================================
-# Step 2: Load metadata
+# Step 2: Load metadata and Zarr dimensions
 # =============================================================================
 
 print("Step 2: Loading embeddings metadata...")
 with open(METADATA_FILE) as f:
     metadata = json.load(f)
 
-src_crs = metadata['crs']
-src_bounds = metadata['bounds']
-src_width = metadata['width']
-src_height = metadata['height']
+# Extract from nested structure
+src_crs = metadata['projection']['crs']
+src_bounds = metadata['bounds']  # [left, bottom, right, top]
 
-# Create source transform
+print(f"  Source CRS: {src_crs}")
+print(f"  Source bounds: {src_bounds}")
+
+# Get actual dimensions from Zarr
+print("  Reading Zarr dimensions...")
+z_temp = zarr.open(FLOAT32_ZARR, mode='r')
+num_bands, src_height, src_width = z_temp.shape
+
+print(f"  Source shape: ({src_height}, {src_width})")
+print(f"  Number of bands: {num_bands}")
+
+# Create source transform from bounds and dimensions
 src_transform = from_bounds(
     src_bounds[0], src_bounds[1], src_bounds[2], src_bounds[3],
     src_width, src_height
 )
 
-print(f"  Source CRS: {src_crs}")
-print(f"  Source shape: ({src_height}, {src_width})")
-print(f"  Source bounds: {src_bounds}")
+print(f"  Source transform: {src_transform}")
 print()
 
 # =============================================================================
