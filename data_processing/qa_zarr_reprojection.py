@@ -230,62 +230,23 @@ if float32_reproj.shape[1:] == gedi_shape:
 else:
     print(f"  ✗ Shape mismatch: {float32_reproj.shape[1:]} vs {gedi_shape}")
 
-# Check data coverage
-valid_f32 = np.isfinite(float32_reproj).sum()
-valid_i8 = np.isfinite(int8_reproj).sum()
-total = float32_reproj[0].size
+# Check data coverage (FIXED - check per band, not total)
+total_per_band = gedi_shape[0] * gedi_shape[1]
+total_all_bands = float32_reproj.size
 
-print(f"  Float32 valid pixels: {valid_f32:,} / {total:,} ({valid_f32 / total * 100:.2f}%)")
-print(f"  Int8 valid pixels: {valid_i8:,} / {total:,} ({valid_i8 / total * 100:.2f}%)")
+valid_f32_per_band = np.isfinite(float32_reproj[0]).sum()  # Just check first band
+valid_i8_per_band = np.isfinite(int8_reproj[0]).sum()      # Just check first band
 
-if valid_f32 > total * 0.9 and valid_i8 > total * 0.9:
+print(f"  Float32 valid pixels (band 1): {valid_f32_per_band:,} / {total_per_band:,} ({valid_f32_per_band/total_per_band*100:.2f}%)")
+print(f"  Int8 valid pixels (band 1): {valid_i8_per_band:,} / {total_per_band:,} ({valid_i8_per_band/total_per_band*100:.2f}%)")
+
+if valid_f32_per_band > total_per_band * 0.9 and valid_i8_per_band > total_per_band * 0.9:
     print(f"  ✓ Good data coverage")
 else:
     print(f"  ⚠ Low data coverage")
 
-print()
-
 # =============================================================================
-# Step 7: Save test outputs (optional - for visual inspection)
-# =============================================================================
-
-print("Step 7: Saving test outputs...")
-
-output_profile = {
-    'driver': 'GTiff',
-    'dtype': 'float32',
-    'count': float32_reproj.shape[0],
-    'height': gedi_shape[0],
-    'width': gedi_shape[1],
-    'crs': gedi_crs,
-    'transform': gedi_transform,
-    'compress': 'lzw'
-}
-
-# Save float32 reprojected
-float32_output = Path(OUTPUT_DIR) / f"healpix_{HEALPIX_ID}_float32_reproj.tif"
-with rasterio.open(float32_output, 'w', **output_profile) as dst:
-    dst.write(float32_reproj)
-print(f"  ✓ Saved: {float32_output.name}")
-
-# Save int8 reprojected
-int8_output = Path(OUTPUT_DIR) / f"healpix_{HEALPIX_ID}_int8_reproj.tif"
-with rasterio.open(int8_output, 'w', **output_profile) as dst:
-    dst.write(int8_reproj)
-print(f"  ✓ Saved: {int8_output.name}")
-
-# Save difference map (first band only for visualization)
-diff_output = Path(OUTPUT_DIR) / f"healpix_{HEALPIX_ID}_diff.tif"
-diff_profile = output_profile.copy()
-diff_profile['count'] = 1
-with rasterio.open(diff_output, 'w', **diff_profile) as dst:
-    dst.write(diff[0:1])
-print(f"  ✓ Saved: {diff_output.name}")
-
-print()
-
-# =============================================================================
-# Step 8: Performance summary
+# Step 7: Performance summary
 # =============================================================================
 
 print("Step 8: Performance Summary")
