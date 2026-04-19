@@ -129,8 +129,7 @@ for tile_idx, HEALPIX_ID in enumerate(chunk_ids):
                 )
 
             z_out = zarr.open(OUT_FLOAT32, mode='w', shape=float32_reproj.shape,
-                              dtype=np.float32, chunks=(1, 256, 256),
-                              compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=2))
+                              dtype=np.float32, chunks=(1, 256, 256))
             z_out[:] = float32_reproj
             print(f"    ✓ Float32 saved")
             del float32_data, float32_reproj
@@ -167,8 +166,7 @@ for tile_idx, HEALPIX_ID in enumerate(chunk_ids):
                 )
 
             z_out = zarr.open(OUT_INT8, mode='w', shape=int8_reproj.shape,
-                              dtype=np.float32, chunks=(1, 256, 256),
-                              compressor=zarr.Blosc(cname='zstd', clevel=5, shuffle=2))
+                              dtype=np.float32, chunks=(1, 256, 256))
             z_out[:] = int8_reproj
             print(f"    ✓ Int8 saved")
             del int8_data, int8_dequant, int8_reproj
