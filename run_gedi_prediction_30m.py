@@ -21,7 +21,14 @@ from tqdm import tqdm
 import json
 import logging
 import pickle
+import time
+import os
 from datetime import datetime
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 
 class GEDIPredictor30m:
@@ -205,45 +212,91 @@ class GEDIPredictor30m:
         finally:
             src.close()
 
-    def prepare_split_data(self, split_name):
+    def _log_progress(self, split_name, i, n_tiles, loaded, skipped, total_samples,
+                      split_start, batch_start):
+        now = time.time()
+        elapsed_total = now - split_start
+        elapsed_batch = now - batch_start
+        rate = (i + 1) / elapsed_total if elapsed_total > 0 else 0
+        eta = (n_tiles - i - 1) / rate if rate > 0 else float('nan')
+        mem_gb = psutil.Process(os.getpid()).memory_info().rss / 1e9 if _HAS_PSUTIL else float('nan')
+        print(
+            f"  [{split_name}] tile {i+1}/{n_tiles} | "
+            f"loaded={loaded} skipped={skipped} | "
+            f"samples_so_far={total_samples:,} | "
+            f"batch_10={elapsed_batch:.1f}s elapsed={elapsed_total:.0f}s ETA={eta:.0f}s | "
+            f"mem={mem_gb:.2f}GB"
+        )
+        self.logger.info(
+            f"[{split_name}] Progress {i+1}/{n_tiles}: loaded={loaded} skipped={skipped} "
+            f"samples={total_samples} elapsed={elapsed_total:.0f}s ETA={eta:.0f}s mem={mem_gb:.2f}GB"
+        )
+
+    def prepare_split_data(self, split_name, max_tiles=None):
         """Load and concatenate all tile data for a split."""
         tiles = self.gdf[self.gdf['split'] == split_name]['healpix_id'].values
-        print(f"\nPreparing '{split_name}' data from {len(tiles)} tiles...")
-        self.logger.info(f"Preparing '{split_name}' split from {len(tiles)} tiles")
+        if max_tiles is not None:
+            tiles = tiles[:max_tiles]
+        n_tiles = len(tiles)
+        print(f"\nPreparing '{split_name}' data from {n_tiles} tiles...")
+        self.logger.info(f"Preparing '{split_name}' split from {n_tiles} tiles")
 
         X_list, y_list = [], []
         loaded, skipped = 0, 0
+        total_samples = 0
+        split_start = time.time()
+        batch_start = split_start
+        log_interval = 5
 
-        for healpix_id in tqdm(tiles, desc=f"Loading {split_name} tiles"):
+        for i, healpix_id in enumerate(tqdm(tiles, desc=f"Loading {split_name} tiles")):
+            tile_start = time.time()
             X_tile, y_tile = self.prepare_tile_data(healpix_id)
+            tile_elapsed = time.time() - tile_start
+
             if X_tile is not None and len(X_tile) > 0:
                 X_list.append(X_tile)
                 y_list.append(y_tile)
                 loaded += 1
+                total_samples += len(y_tile)
+                self.logger.info(
+                    f"  Tile {healpix_id}: {len(y_tile):,} samples in {tile_elapsed:.1f}s"
+                )
             else:
                 skipped += 1
+                self.logger.info(
+                    f"  Tile {healpix_id}: skipped ({tile_elapsed:.1f}s)"
+                )
+
+            if (i + 1) % log_interval == 0 or (i + 1) == n_tiles:
+                self._log_progress(split_name, i, n_tiles, loaded, skipped,
+                                   total_samples, split_start, batch_start)
+                batch_start = time.time()
 
         if not X_list:
             print(f"Warning: No valid data for '{split_name}' split")
             self.logger.warning(f"No valid data for '{split_name}' split")
             return None, None
 
+        print(f"  Stacking arrays for '{split_name}'...")
+        stack_start = time.time()
         X = np.vstack(X_list)
         y = np.concatenate(y_list)
+        print(f"  Stack took {time.time() - stack_start:.1f}s")
 
-        print(f"  {loaded}/{len(tiles)} tiles loaded, {skipped} skipped")
-        print(f"  Samples: {X.shape[0]}, Features: {X.shape[1]}")
+        total_elapsed = time.time() - split_start
+        print(f"  {loaded}/{n_tiles} tiles loaded, {skipped} skipped  (total {total_elapsed:.0f}s)")
+        print(f"  Samples: {X.shape[0]:,}, Features: {X.shape[1]}")
         print(f"  Height range: [{y.min():.2f}, {y.max():.2f}] m  mean={y.mean():.2f}")
         self.logger.info(
-            f"'{split_name}': {X.shape[0]} samples from {loaded} tiles "
-            f"({skipped} skipped)"
+            f"'{split_name}': {X.shape[0]:,} samples from {loaded} tiles "
+            f"({skipped} skipped) in {total_elapsed:.0f}s"
         )
         return X, y
 
     def train(self, n_estimators=100, max_depth=None, min_samples_split=2,
-              max_features='sqrt', n_jobs=-1, random_state=42):
+              max_features='sqrt', n_jobs=-1, random_state=42, max_tiles=None):
         """Train the Random Forest on the training split."""
-        X_train, y_train = self.prepare_split_data('train')
+        X_train, y_train = self.prepare_split_data('train', max_tiles=max_tiles)
         if X_train is None:
             raise ValueError("No training data available")
 
@@ -272,12 +325,12 @@ class GEDIPredictor30m:
         self.logger.info(f"Train metrics: {metrics}")
         return {'train': metrics}
 
-    def evaluate(self, split_name='val'):
+    def evaluate(self, split_name='val', max_tiles=None):
         """Evaluate trained model on a split."""
         if self.model is None:
             raise ValueError("Model not trained yet")
 
-        X, y = self.prepare_split_data(split_name)
+        X, y = self.prepare_split_data(split_name, max_tiles=max_tiles)
         if X is None:
             return None
 
@@ -399,6 +452,8 @@ def main():
     parser.add_argument('--max-depth', type=int, default=None)
     parser.add_argument('--min-samples-split', type=int, default=2)
     parser.add_argument('--random-state', type=int, default=42)
+    parser.add_argument('--max-tiles', type=int, default=None,
+                        help='Limit tiles per split (for pipeline testing)')
 
     args = parser.parse_args()
 
@@ -415,10 +470,11 @@ def main():
         max_depth=args.max_depth,
         min_samples_split=args.min_samples_split,
         random_state=args.random_state,
+        max_tiles=args.max_tiles,
     )
 
-    val_metrics = predictor.evaluate('val')
-    test_metrics = predictor.evaluate('test')
+    val_metrics = predictor.evaluate('val', max_tiles=args.max_tiles)
+    test_metrics = predictor.evaluate('test', max_tiles=args.max_tiles)
 
     all_metrics = {
         'train': train_metrics['train'],
