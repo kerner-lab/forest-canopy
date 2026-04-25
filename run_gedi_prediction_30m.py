@@ -10,6 +10,7 @@ Predicts non-zero forest height only (GEDI > 0m).
 """
 
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 import rasterio
 import zarr
@@ -35,7 +36,7 @@ class GEDIPredictor30m:
     """Pipeline for GEDI canopy height prediction using OLMo 30m embeddings"""
 
     def __init__(self, shapefile_path, gedi_dir, embeddings_dir, output_dir,
-                 embedding_format='float32'):
+                 embedding_format='float32', preprocessed_dir=None):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -43,6 +44,8 @@ class GEDIPredictor30m:
             embeddings_dir: Directory containing zarr embedding files
             output_dir: Directory for outputs
             embedding_format: 'float32' or 'int8'
+            preprocessed_dir: Optional path to .npz cache from preprocess_olmo_to_gedi_tiles.py.
+                               When set, zarr/rasterio loading is skipped entirely.
         """
         if embedding_format not in ('float32', 'int8'):
             raise ValueError("embedding_format must be 'float32' or 'int8'")
@@ -52,6 +55,7 @@ class GEDIPredictor30m:
         self.embeddings_dir = Path(embeddings_dir)
         self.output_dir = Path(output_dir)
         self.embedding_format = embedding_format
+        self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
@@ -66,6 +70,8 @@ class GEDIPredictor30m:
         print(f"Loaded {len(self.gdf)} tiles")
         print(f"Split distribution:\n{self.gdf['split'].value_counts()}")
         print(f"Embedding format: {embedding_format}")
+        if self.preprocessed_dir:
+            print(f"Using preprocessed cache: {self.preprocessed_dir}")
 
         self.model = None
         self.feature_names = None
@@ -233,7 +239,11 @@ class GEDIPredictor30m:
         )
 
     def prepare_split_data(self, split_name, max_tiles=None):
-        """Load and concatenate all tile data for a split."""
+        """Load and concatenate all tile data for a split.
+
+        When self.preprocessed_dir is set, reads .npz cache files written by
+        preprocess_olmo_to_gedi_tiles.py instead of re-loading zarr + rasterio.
+        """
         tiles = self.gdf[self.gdf['split'] == split_name]['healpix_id'].values
         if max_tiles is not None:
             tiles = tiles[:max_tiles]
@@ -250,7 +260,32 @@ class GEDIPredictor30m:
 
         for i, healpix_id in enumerate(tqdm(tiles, desc=f"Loading {split_name} tiles")):
             tile_start = time.time()
-            X_tile, y_tile = self.prepare_tile_data(healpix_id)
+
+            skip_reason = None
+            if self.preprocessed_dir is not None:
+                cache_path = (
+                    self.preprocessed_dir
+                    / f"healpix_{healpix_id}_{self.embedding_format}.npz"
+                )
+                if cache_path.exists():
+                    npz = np.load(cache_path)
+                    X_tile, y_tile = npz['X'], npz['y']
+                else:
+                    self.logger.warning(f"Cache missing for tile {healpix_id}: {cache_path}")
+                    X_tile, y_tile = None, None
+                    skip_reason = "cache_missing"
+            else:
+                emb_count_before = len(self.missing_embeddings)
+                gedi_count_before = len(self.missing_gedi)
+                X_tile, y_tile = self.prepare_tile_data(healpix_id)
+                if X_tile is None:
+                    if len(self.missing_embeddings) > emb_count_before:
+                        skip_reason = "missing_embedding"
+                    elif len(self.missing_gedi) > gedi_count_before:
+                        skip_reason = "missing_gedi"
+                    else:
+                        skip_reason = "no_valid_pixels"
+
             tile_elapsed = time.time() - tile_start
 
             if X_tile is not None and len(X_tile) > 0:
@@ -264,7 +299,7 @@ class GEDIPredictor30m:
             else:
                 skipped += 1
                 self.logger.info(
-                    f"  Tile {healpix_id}: skipped ({tile_elapsed:.1f}s)"
+                    f"  Tile {healpix_id}: skipped [{skip_reason}] ({tile_elapsed:.1f}s)"
                 )
 
             if (i + 1) % log_interval == 0 or (i + 1) == n_tiles:
@@ -302,7 +337,8 @@ class GEDIPredictor30m:
 
         self.feature_names = [f"emb_{i}" for i in range(X_train.shape[1])]
 
-        print(f"\nTraining Random Forest ({n_estimators} trees)...")
+        print(f"\nTraining Random Forest ({n_estimators} trees, {X_train.shape[0]:,} samples)...")
+        self.logger.info(f"Training RF: {n_estimators} trees, {X_train.shape[0]:,} samples, {X_train.shape[1]} features")
         self.model = RandomForestRegressor(
             n_estimators=n_estimators,
             max_depth=max_depth,
@@ -312,7 +348,11 @@ class GEDIPredictor30m:
             random_state=random_state,
             verbose=1,
         )
+        train_start = time.time()
         self.model.fit(X_train, y_train)
+        train_elapsed = time.time() - train_start
+        print(f"RF training took {train_elapsed:.0f}s ({train_elapsed/60:.1f} min)")
+        self.logger.info(f"RF training completed in {train_elapsed:.0f}s")
 
         y_pred = self.model.predict(X_train)
         metrics = {
@@ -323,6 +363,7 @@ class GEDIPredictor30m:
         }
         print(f"Train  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}")
         self.logger.info(f"Train metrics: {metrics}")
+        self._save_predictions(y_train, y_pred, 'train')
         return {'train': metrics}
 
     def evaluate(self, split_name='val', max_tiles=None):
@@ -344,8 +385,16 @@ class GEDIPredictor30m:
         print(f"{split_name.capitalize()}  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}")
         self.logger.info(f"'{split_name}' metrics: {metrics}")
 
+        self._save_predictions(y, y_pred, split_name)
         self._plot_predictions(y, y_pred, split_name)
         return metrics
+
+    def _save_predictions(self, y_true, y_pred, split_name):
+        df = pd.DataFrame({'y_true': y_true.astype(np.float32), 'y_pred': y_pred.astype(np.float32)})
+        out = self.output_dir / f'predictions_{split_name}.parquet'
+        df.to_parquet(out, index=False, compression='snappy')
+        print(f"Saved predictions: {out}  ({out.stat().st_size / 1e6:.1f} MB)")
+        self.logger.info(f"Saved {split_name} predictions parquet: {out}")
 
     def _plot_predictions(self, y_true, y_pred, split_name):
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -454,6 +503,9 @@ def main():
     parser.add_argument('--random-state', type=int, default=42)
     parser.add_argument('--max-tiles', type=int, default=None,
                         help='Limit tiles per split (for pipeline testing)')
+    parser.add_argument('--preprocessed-dir', default=None,
+                        help='Path to .npz cache from preprocess_olmo_to_gedi_tiles.py. '
+                             'When set, skips zarr/rasterio loading entirely.')
 
     args = parser.parse_args()
 
@@ -463,6 +515,7 @@ def main():
         embeddings_dir=args.embeddings_dir,
         output_dir=args.output_dir,
         embedding_format=args.embedding_format,
+        preprocessed_dir=args.preprocessed_dir,
     )
 
     train_metrics = predictor.train(
