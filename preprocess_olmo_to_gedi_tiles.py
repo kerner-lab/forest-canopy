@@ -248,7 +248,8 @@ def main():
         'missing_embeddings': missing_embeddings,
         'missing_gedi': missing_gedi,
     }
-    summary_path = output_dir / 'preprocess_summary.json'
+    splits_tag = "_".join(args.splits)
+    summary_path = output_dir / f'preprocess_summary_{splits_tag}.json'
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"Summary written: {summary_path}")
