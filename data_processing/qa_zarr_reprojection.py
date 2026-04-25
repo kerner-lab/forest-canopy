@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
 QA Script: Test Zarr embeddings reprojection to GEDI grid
+
+Usage:
+    # Process all tiles discovered from GEDI dir
+    python qa_zarr_reprojection.py
+
+    # Process specific tiles only
+    python qa_zarr_reprojection.py --tiles 12345 67890 11111
+
+    # Override directories
+    python qa_zarr_reprojection.py --zarr-dir /path/to/zarr --gedi-dir /path/to/gedi --output-dir /path/to/out
 """
 
+import argparse
 import zarr
 import rasterio
 from rasterio.warp import reproject, Resampling
@@ -13,26 +24,45 @@ from pathlib import Path
 import time
 import re
 
-# =============================================================================
-# Configuration
-# =============================================================================
 
-ZARR_DIR = "/scratch/kdoerkse/olmo/california_embeddings_zarr_30m"
-GEDI_DIR = "/scratch/kdoerkse/olmo/gedi"
-OUTPUT_DIR = "/scratch/kdoerkse/olmo/california_embeddings_30m_reproj"
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Reproject zarr embeddings to GEDI grid and run QA comparison'
+    )
+    parser.add_argument('--zarr-dir', default='/scratch/kdoerkse/olmo/california_embeddings_zarr_30m',
+                        help='Directory containing source zarr embedding files')
+    parser.add_argument('--gedi-dir', default='/scratch/kdoerkse/olmo/gedi',
+                        help='Directory containing GEDI tif files')
+    parser.add_argument('--output-dir', default='/scratch/kdoerkse/olmo/california_embeddings_30m_reproj',
+                        help='Directory to write reprojected zarr files')
+    parser.add_argument('--tiles', nargs='+', metavar='HEALPIX_ID',
+                        help='Specific healpix IDs to process (default: all tiles found in --gedi-dir)')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Re-process tiles whose output zarrs already exist')
+    return parser.parse_args()
+
+
+args = parse_args()
+
+ZARR_DIR = args.zarr_dir
+GEDI_DIR = args.gedi_dir
+OUTPUT_DIR = args.output_dir
 
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-# Discover all healpix IDs from GEDI tile filenames
-gedi_files = sorted(Path(GEDI_DIR).glob("healpix_*_gedi.tif"))
-healpix_ids = []
-for f in gedi_files:
-    m = re.match(r"healpix_(\d+)_gedi\.tif", f.name)
-    if m:
-        healpix_ids.append(m.group(1))
+if args.tiles:
+    healpix_ids = [str(t) for t in args.tiles]
+    print(f"Processing {len(healpix_ids)} specified tiles: {healpix_ids}")
+else:
+    gedi_files = sorted(Path(GEDI_DIR).glob("healpix_*_gedi.tif"))
+    healpix_ids = []
+    for f in gedi_files:
+        m = re.match(r"healpix_(\d+)_gedi\.tif", f.name)
+        if m:
+            healpix_ids.append(m.group(1))
 
-if not healpix_ids:
-    raise RuntimeError(f"No GEDI tiles found in {GEDI_DIR}")
+    if not healpix_ids:
+        raise RuntimeError(f"No GEDI tiles found in {GEDI_DIR}")
 
 print("=" * 70)
 print("ZARR REPROJECTION - BATCH PROCESSING")
@@ -57,8 +87,8 @@ for tile_idx, HEALPIX_ID in enumerate(healpix_ids):
     OUT_FLOAT32 = f"{OUTPUT_DIR}/healpix_{HEALPIX_ID}_embeddings_float32_reproj.zarr"
     OUT_INT8 = f"{OUTPUT_DIR}/healpix_{HEALPIX_ID}_embeddings_int8_reproj.zarr"
 
-    # Skip if both outputs already exist
-    if Path(OUT_FLOAT32).exists() and Path(OUT_INT8).exists():
+    # Skip if both outputs already exist (unless --overwrite)
+    if not args.overwrite and Path(OUT_FLOAT32).exists() and Path(OUT_INT8).exists():
         print(f"  Skipping — outputs already exist")
         continue
 
