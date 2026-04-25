@@ -139,6 +139,45 @@ def process_tile(healpix_id, embeddings_dir, gedi_dir, embedding_format, logger)
     return X, y
 
 
+def check_inputs(tiles_df, embeddings_dir, gedi_dir, embedding_format, output_dir, overwrite):
+    """Print a pre-flight existence report for all tiles and return counts."""
+    n_ready = n_missing_emb = n_missing_gedi = n_cached = 0
+    missing_emb_ids, missing_gedi_ids = [], []
+
+    for _, row in tiles_df.iterrows():
+        hid = row['healpix_id']
+        cache_path = tile_cache_path(output_dir, hid, embedding_format)
+        if not overwrite and cache_path.exists():
+            n_cached += 1
+            continue
+        emb_path = embeddings_dir / f"healpix_{hid}_embeddings_{embedding_format}_reproj.zarr"
+        gedi_found = any(
+            (gedi_dir / f"healpix_{hid}_gedi{ext}").exists()
+            for ext in ('.tif', '.tiff', '')
+        )
+        if not emb_path.exists():
+            n_missing_emb += 1
+            missing_emb_ids.append(int(hid))
+        elif not gedi_found:
+            n_missing_gedi += 1
+            missing_gedi_ids.append(int(hid))
+        else:
+            n_ready += 1
+
+    print(f"\n{'='*60}")
+    print(f"Input existence check ({len(tiles_df)} tiles)")
+    print(f"  Ready to process : {n_ready}")
+    print(f"  Already cached   : {n_cached}")
+    print(f"  Missing embedding: {n_missing_emb}")
+    if missing_emb_ids:
+        print(f"    {missing_emb_ids}")
+    print(f"  Missing GEDI     : {n_missing_gedi}")
+    if missing_gedi_ids:
+        print(f"    {missing_gedi_ids}")
+    print(f"{'='*60}")
+    return n_ready, n_missing_emb, n_missing_gedi, n_cached
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Preprocess GEDI tiles to .npz cache for fast ML training'
@@ -154,8 +193,12 @@ def main():
     parser.add_argument('--embedding-format', choices=['float32', 'int8'], default='float32')
     parser.add_argument('--splits', nargs='+', default=['train', 'val', 'test'],
                         help='Which splits to process (default: all three)')
+    parser.add_argument('--tiles', nargs='+', metavar='HEALPIX_ID', type=int,
+                        help='Process only these healpix IDs (must belong to the selected splits)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Re-process tiles that already have a cached .npz')
+    parser.add_argument('--check-only', action='store_true',
+                        help='Check input file existence and print a report, then exit without processing')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -170,7 +213,24 @@ def main():
     print(f"Split distribution:\n{gdf['split'].value_counts()}")
 
     tiles_df = gdf[gdf['split'].isin(args.splits)][['healpix_id', 'split']].copy()
-    print(f"\nProcessing {len(tiles_df)} tiles across splits: {args.splits}")
+
+    if args.tiles:
+        requested = set(args.tiles)
+        tiles_df = tiles_df[tiles_df['healpix_id'].isin(requested)].copy()
+        found = set(tiles_df['healpix_id'].tolist())
+        missing_from_shp = requested - found
+        if missing_from_shp:
+            print(f"Warning: {len(missing_from_shp)} requested tiles not found in splits {args.splits}: "
+                  f"{sorted(missing_from_shp)}")
+        print(f"\nProcessing {len(tiles_df)} specified tiles across splits: {args.splits}")
+    else:
+        print(f"\nProcessing {len(tiles_df)} tiles across splits: {args.splits}")
+
+    if args.check_only:
+        check_inputs(tiles_df, embeddings_dir, gedi_dir, args.embedding_format, output_dir, args.overwrite)
+        return
+
+    check_inputs(tiles_df, embeddings_dir, gedi_dir, args.embedding_format, output_dir, args.overwrite)
     logger.info(f"Processing {len(tiles_df)} tiles, format={args.embedding_format}")
 
     n_processed = 0
