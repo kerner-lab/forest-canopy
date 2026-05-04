@@ -17,6 +17,7 @@ run_gedi_prediction_30m.py via --preprocessed-dir.
 """
 
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 import rasterio
 import zarr
@@ -199,6 +200,11 @@ def main():
                         help='Re-process tiles that already have a cached .npz')
     parser.add_argument('--check-only', action='store_true',
                         help='Check input file existence and print a report, then exit without processing')
+    parser.add_argument('--subset-fraction', type=float, default=None,
+                        help='Randomly sample this fraction (0, 1] of tiles per split before processing. '
+                             'Selected tile IDs are saved to subset_tiles.json.')
+    parser.add_argument('--subset-seed', type=int, default=42,
+                        help='Random seed for subset tile sampling (default: 42)')
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -213,6 +219,26 @@ def main():
     print(f"Split distribution:\n{gdf['split'].value_counts()}")
 
     tiles_df = gdf[gdf['split'].isin(args.splits)][['healpix_id', 'split']].copy()
+
+    if args.subset_fraction is not None and args.subset_fraction < 1.0:
+        rng = np.random.default_rng(args.subset_seed)
+        sampled_parts = []
+        subset_record = {}
+        for split in args.splits:
+            split_df = tiles_df[tiles_df['split'] == split]
+            n_subset = max(1, int(round(len(split_df) * args.subset_fraction)))
+            chosen_ids = rng.choice(split_df['healpix_id'].values, size=n_subset, replace=False)
+            chosen_ids = np.sort(chosen_ids)
+            sampled_parts.append(split_df[split_df['healpix_id'].isin(chosen_ids)])
+            subset_record[split] = [int(i) for i in chosen_ids]
+            print(f"  Subset '{split}': {n_subset}/{len(split_df)} tiles sampled")
+        tiles_df = pd.concat(sampled_parts).copy()
+        subset_path = output_dir / 'subset_tiles.json'
+        with open(subset_path, 'w') as f:
+            json.dump({'subset_fraction': args.subset_fraction,
+                       'subset_seed': args.subset_seed,
+                       'splits': subset_record}, f, indent=2)
+        print(f"Subset tile IDs saved: {subset_path}")
 
     if args.tiles:
         requested = set(args.tiles)

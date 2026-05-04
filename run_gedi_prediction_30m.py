@@ -36,7 +36,8 @@ class GEDIPredictor30m:
     """Pipeline for GEDI canopy height prediction using OLMo 30m embeddings"""
 
     def __init__(self, shapefile_path, gedi_dir, embeddings_dir, output_dir,
-                 embedding_format='float32', preprocessed_dir=None):
+                 embedding_format='float32', preprocessed_dir=None,
+                 subset_fraction=None, subset_seed=42):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -46,9 +47,14 @@ class GEDIPredictor30m:
             embedding_format: 'float32' or 'int8'
             preprocessed_dir: Optional path to .npz cache from preprocess_olmo_to_gedi_tiles.py.
                                When set, zarr/rasterio loading is skipped entirely.
+            subset_fraction: If set (0 < float <= 1), randomly sample this fraction of tiles
+                             per split. Tile IDs are saved to subset_tiles.json for reproducibility.
+            subset_seed: Random seed used for subset sampling (default: 42).
         """
         if embedding_format not in ('float32', 'int8'):
             raise ValueError("embedding_format must be 'float32' or 'int8'")
+        if subset_fraction is not None and not (0 < subset_fraction <= 1):
+            raise ValueError("subset_fraction must be between 0 (exclusive) and 1 (inclusive)")
 
         self.shapefile_path = Path(shapefile_path)
         self.gedi_dir = Path(gedi_dir)
@@ -56,6 +62,8 @@ class GEDIPredictor30m:
         self.output_dir = Path(output_dir)
         self.embedding_format = embedding_format
         self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
+        self.subset_fraction = subset_fraction
+        self.subset_seed = subset_seed
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
@@ -72,9 +80,12 @@ class GEDIPredictor30m:
         print(f"Embedding format: {embedding_format}")
         if self.preprocessed_dir:
             print(f"Using preprocessed cache: {self.preprocessed_dir}")
+        if self.subset_fraction is not None:
+            print(f"Subset fraction: {self.subset_fraction} (seed={self.subset_seed})")
 
         self.model = None
         self.feature_names = None
+        self._subset_tile_ids = {}  # populated on first use per split
 
     def _setup_logging(self):
         self.logger = logging.getLogger('GEDIPredictor30m')
@@ -245,6 +256,16 @@ class GEDIPredictor30m:
         preprocess_olmo_to_gedi_tiles.py instead of re-loading zarr + rasterio.
         """
         tiles = self.gdf[self.gdf['split'] == split_name]['healpix_id'].values
+        if self.subset_fraction is not None and self.subset_fraction < 1.0:
+            rng = np.random.default_rng(self.subset_seed)
+            n_subset = max(1, int(round(len(tiles) * self.subset_fraction)))
+            tiles = rng.choice(tiles, size=n_subset, replace=False)
+            tiles = np.sort(tiles)
+            self._subset_tile_ids[split_name] = tiles.tolist()
+            self.logger.info(
+                f"Subset sampling '{split_name}': {n_subset}/{len(self.gdf[self.gdf['split'] == split_name])} "
+                f"tiles (fraction={self.subset_fraction}, seed={self.subset_seed})"
+            )
         if max_tiles is not None:
             tiles = tiles[:max_tiles]
         n_tiles = len(tiles)
@@ -453,6 +474,21 @@ class GEDIPredictor30m:
         print(f"Saved model: {model_path}")
         self.logger.info(f"Saved model: {model_path}")
 
+    def save_subset_tiles(self):
+        """Save the sampled tile IDs to JSON so the experiment is reproducible."""
+        if not self._subset_tile_ids:
+            return
+        out = self.output_dir / 'subset_tiles.json'
+        payload = {
+            'subset_fraction': self.subset_fraction,
+            'subset_seed': self.subset_seed,
+            'splits': {k: [int(v) for v in vs] for k, vs in self._subset_tile_ids.items()},
+        }
+        with open(out, 'w') as f:
+            json.dump(payload, f, indent=2)
+        print(f"Saved subset tile IDs: {out}")
+        self.logger.info(f"Saved subset tile IDs: {out}")
+
     def save_metrics(self, metrics, filename='metrics.json'):
         path = self.output_dir / filename
         with open(path, 'w') as f:
@@ -506,6 +542,11 @@ def main():
     parser.add_argument('--preprocessed-dir', default=None,
                         help='Path to .npz cache from preprocess_olmo_to_gedi_tiles.py. '
                              'When set, skips zarr/rasterio loading entirely.')
+    parser.add_argument('--subset-fraction', type=float, default=None,
+                        help='Randomly sample this fraction (0, 1] of tiles per split. '
+                             'Selected tile IDs are saved to subset_tiles.json.')
+    parser.add_argument('--subset-seed', type=int, default=42,
+                        help='Random seed for subset tile sampling (default: 42)')
 
     args = parser.parse_args()
 
@@ -516,6 +557,8 @@ def main():
         output_dir=args.output_dir,
         embedding_format=args.embedding_format,
         preprocessed_dir=args.preprocessed_dir,
+        subset_fraction=args.subset_fraction,
+        subset_seed=args.subset_seed,
     )
 
     train_metrics = predictor.train(
@@ -540,6 +583,7 @@ def main():
     predictor.print_missing_summary()
     predictor.save_model()
     predictor.save_metrics(all_metrics)
+    predictor.save_subset_tiles()
 
     print("\n" + "=" * 50)
     print("Complete!")
