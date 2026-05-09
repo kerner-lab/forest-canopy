@@ -25,13 +25,18 @@ SPLIT_COLORS = {
 }
 
 
-def load_predictions(predictions_dir, split):
+def load_predictions(predictions_dir, split, max_height=None):
     path = Path(predictions_dir) / f'predictions_{split}.parquet'
     if not path.exists():
         print(f"  Warning: {path} not found, skipping {split}")
         return None
     df = pd.read_parquet(path)
-    print(f"  Loaded {split}: {len(df):,} samples")
+    if max_height is not None:
+        before = len(df)
+        df = df[df['y_true'] < max_height].reset_index(drop=True)
+        print(f"  Loaded {split}: {len(df):,} samples (filtered {before - len(df):,} above {max_height}m)")
+    else:
+        print(f"  Loaded {split}: {len(df):,} samples")
     return df
 
 
@@ -131,6 +136,9 @@ def main():
     parser.add_argument('--splits', nargs='+', default=['val', 'test'],
                         choices=['train', 'val', 'test'],
                         help='Which splits to plot (default: val test)')
+    parser.add_argument('--max-height', type=float, default=None,
+                        help='Exclude samples where ground truth >= this value in metres '
+                             '(e.g. --max-height 70 to match evaluate.py default)')
     args = parser.parse_args()
 
     predictions_dir = Path(args.predictions_dir)
@@ -140,7 +148,7 @@ def main():
     print(f"Loading predictions from: {predictions_dir}")
     datasets = {}
     for split in args.splits:
-        df = load_predictions(predictions_dir, split)
+        df = load_predictions(predictions_dir, split, max_height=args.max_height)
         if df is not None:
             datasets[split] = df
 
@@ -148,10 +156,11 @@ def main():
         print("No prediction files found.")
         return
 
+    height_tag = f'_max{int(args.max_height)}m' if args.max_height is not None else ''
     for split, df in datasets.items():
         print(f"\nGenerating plots for {split}...")
-        plot_density_single(split, df, output_dir / f'density_{split}.png')
-        plot_scatter_single(split, df, output_dir / f'scatter_{split}.png')
+        plot_density_single(split, df, output_dir / f'density_{split}{height_tag}.png')
+        plot_scatter_single(split, df, output_dir / f'scatter_{split}{height_tag}.png')
 
     print("\nDone.")
 

@@ -9,62 +9,88 @@ import os
 import sys
 import rasterio
 import numpy as np
+import pandas as pd
 from scipy import stats
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error
 
 
+def _load_from_parquet(parquet_file, eval_min_height, eval_max_height):
+    """Load pred_arr and gedi_arr from a parquet file (y_true/y_pred already in metres)."""
+    df = pd.read_parquet(parquet_file)
+    gedi_arr = df['y_true'].values.astype(np.float64)
+    pred_arr = df['y_pred'].values.astype(np.float64)
+
+    if eval_min_height is not None:
+        mask = gedi_arr >= eval_min_height
+        gedi_arr = gedi_arr[mask]
+        pred_arr = pred_arr[mask]
+
+    if eval_max_height is not None:
+        mask = gedi_arr <= eval_max_height
+        gedi_arr = gedi_arr[mask]
+        pred_arr = pred_arr[mask]
+
+    return pred_arr, gedi_arr
+
+
 def main(preds_dir, gedi_dir, data_file, out_plot, subsample_factor, ignore_above,
-         eval_min_height, eval_max_height):
-    for f in [preds_dir, gedi_dir, data_file]:
-        if not os.path.exists(f):
-            print(f'Input dir/file not found: {f}')
+         eval_min_height, eval_max_height, parquet=None):
+    if parquet is not None:
+        if not os.path.exists(parquet):
+            print(f'Parquet file not found: {parquet}')
             sys.exit(1)
+        pred_arr, gedi_arr = _load_from_parquet(parquet, eval_min_height, eval_max_height)
+    else:
+        for f in [preds_dir, gedi_dir, data_file]:
+            if not os.path.exists(f):
+                print(f'Input dir/file not found: {f}')
+                sys.exit(1)
 
-    with open(data_file, 'r') as f:
-        tile_indices = f.readlines()
-        tile_indices = [t.strip() for t in tile_indices]
+        with open(data_file, 'r') as f:
+            tile_indices = f.readlines()
+            tile_indices = [t.strip() for t in tile_indices]
 
-    # Load in all prediction and GEDI tiles
-    pred_arr = np.array([])
-    gedi_arr = np.array([])
-    for tile_index in tqdm(tile_indices, desc='Loading tiles'):
-        pred_file = os.path.join(preds_dir,
-                                 f'prediction_rh98_30.0m_{tile_index.replace("_v6", "")}.tif')
-        pred_src = rasterio.open(pred_file, 'r')
-        pred_data = np.squeeze(pred_src.read(), axis=0)
-        pred_src.close()
+        # Load in all prediction and GEDI tiles
+        pred_arr = np.array([])
+        gedi_arr = np.array([])
+        for tile_index in tqdm(tile_indices, desc='Loading tiles'):
+            pred_file = os.path.join(preds_dir,
+                                     f'prediction_rh98_30.0m_{tile_index.replace("_v6", "")}.tif')
+            pred_src = rasterio.open(pred_file, 'r')
+            pred_data = np.squeeze(pred_src.read(), axis=0)
+            pred_src.close()
 
-        gedi_file = os.path.join(gedi_dir,
-                                 f'gedi_rh98_30.0m_{tile_index.replace("_v6", "")}.tif')
-        gedi_src = rasterio.open(gedi_file, 'r')
-        gedi_data = np.squeeze(gedi_src.read(), axis=0)
-        gedi_src.close()
+            gedi_file = os.path.join(gedi_dir,
+                                     f'gedi_rh98_30.0m_{tile_index.replace("_v6", "")}.tif')
+            gedi_src = rasterio.open(gedi_file, 'r')
+            gedi_data = np.squeeze(gedi_src.read(), axis=0)
+            gedi_src.close()
 
-        # Mask out locations where GEDI ground truth isn't available
-        mask = np.where(gedi_data != 0)
-        pred_data = pred_data[mask]
-        gedi_data = gedi_data[mask]
+            # Mask out locations where GEDI ground truth isn't available
+            mask = np.where(gedi_data != 0)
+            pred_data = pred_data[mask]
+            gedi_data = gedi_data[mask]
 
-        # Mask out locations where GEDI ground truth values are smaller than
-        # eval_min_height or greater than eval_max_height
-        if eval_min_height is not None:
-            min_mask = np.where(gedi_data / 100. >= eval_min_height)
-            gedi_data = gedi_data[min_mask]
-            pred_data = pred_data[min_mask]
+            # Mask out locations where GEDI ground truth values are smaller than
+            # eval_min_height or greater than eval_max_height
+            if eval_min_height is not None:
+                min_mask = np.where(gedi_data / 100. >= eval_min_height)
+                gedi_data = gedi_data[min_mask]
+                pred_data = pred_data[min_mask]
 
-        if eval_max_height is not None:
-            max_mask = np.where(gedi_data / 100. <= eval_max_height)
-            gedi_data = gedi_data[max_mask]
-            pred_data = pred_data[max_mask]
+            if eval_max_height is not None:
+                max_mask = np.where(gedi_data / 100. <= eval_max_height)
+                gedi_data = gedi_data[max_mask]
+                pred_data = pred_data[max_mask]
 
-        pred_arr = np.hstack((pred_arr, pred_data.flatten()))
-        gedi_arr = np.hstack((gedi_arr, gedi_data.flatten()))
+            pred_arr = np.hstack((pred_arr, pred_data.flatten()))
+            gedi_arr = np.hstack((gedi_arr, gedi_data.flatten()))
 
-    # Predictions are already in m, but GEDI values are in cm. Convert GEDI values
-    # to m.
-    gedi_arr = gedi_arr / 100.
+        # Predictions are already in m, but GEDI values are in cm. Convert GEDI values
+        # to m.
+        gedi_arr = gedi_arr / 100.
 
     # Generate evaluation figure
     fig, _ = plt.subplots()
@@ -143,10 +169,10 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('preds_dir', type=str)
-    parser.add_argument('gedi_dir', type=str)
-    parser.add_argument('data_file', type=str)
-    parser.add_argument('out_plot', type=str)
+    parser.add_argument('preds_dir', type=str, nargs='?', default=None)
+    parser.add_argument('gedi_dir', type=str, nargs='?', default=None)
+    parser.add_argument('data_file', type=str, nargs='?', default=None)
+    parser.add_argument('out_plot', type=str, nargs='?', default=None)
     parser.add_argument('--subsample_factor', type=int, default=10)
     parser.add_argument('--ignore_above', type=float, default=70,
                         help='If labels are above the number defined by '
@@ -155,6 +181,21 @@ if __name__ == '__main__':
                              'meter, all samples will be included in evaluation.')
     parser.add_argument('--eval_min_height', type=float, required=False)
     parser.add_argument('--eval_max_height', type=float, required=False)
+    parser.add_argument('--parquet', type=str, default=None,
+                        help='Path to a predictions parquet file (y_true, y_pred columns, '
+                             'values in metres). When set, preds_dir/gedi_dir/data_file '
+                             'are not required.')
 
     args = parser.parse_args()
+
+    if args.parquet is None and any(v is None for v in [args.preds_dir, args.gedi_dir, args.data_file]):
+        parser.error('preds_dir, gedi_dir, and data_file are required unless --parquet is provided')
+
+    if args.out_plot is None:
+        if args.parquet is not None:
+            p = os.path.splitext(args.parquet)
+            args.out_plot = p[0] + '_evaluate.png'
+        else:
+            parser.error('out_plot is required when not using --parquet')
+
     main(**vars(args))

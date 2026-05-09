@@ -37,7 +37,9 @@ class GEDIPredictor30m:
 
     def __init__(self, shapefile_path, gedi_dir, embeddings_dir, output_dir,
                  embedding_format='float32', preprocessed_dir=None,
-                 subset_fraction=None, subset_seed=42):
+                 subset_fraction=None, subset_seed=42,
+                 stratified_sample_fraction=None, stratified_sample_seed=42,
+                 stratified_splits=None):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -50,11 +52,19 @@ class GEDIPredictor30m:
             subset_fraction: If set (0 < float <= 1), randomly sample this fraction of tiles
                              per split. Tile IDs are saved to subset_tiles.json for reproducibility.
             subset_seed: Random seed used for subset sampling (default: 42).
+            stratified_sample_fraction: If set (0 < float <= 1), after loading all tile data for
+                                        a split, sample this fraction of pixels per 10 m height bin
+                                        (stratified by GEDI ground-truth height). Saves per-bin
+                                        counts to stratified_sample_info.json.
+            stratified_sample_seed: Random seed for stratified pixel sampling (default: 42).
+            stratified_splits: List of split names to apply stratified sampling to (default: ['train']).
         """
         if embedding_format not in ('float32', 'int8'):
             raise ValueError("embedding_format must be 'float32' or 'int8'")
         if subset_fraction is not None and not (0 < subset_fraction <= 1):
             raise ValueError("subset_fraction must be between 0 (exclusive) and 1 (inclusive)")
+        if stratified_sample_fraction is not None and not (0 < stratified_sample_fraction <= 1):
+            raise ValueError("stratified_sample_fraction must be between 0 (exclusive) and 1 (inclusive)")
 
         self.shapefile_path = Path(shapefile_path)
         self.gedi_dir = Path(gedi_dir)
@@ -64,6 +74,9 @@ class GEDIPredictor30m:
         self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
         self.subset_fraction = subset_fraction
         self.subset_seed = subset_seed
+        self.stratified_sample_fraction = stratified_sample_fraction
+        self.stratified_sample_seed = stratified_sample_seed
+        self.stratified_splits = set(stratified_splits) if stratified_splits else {'train'}
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
@@ -82,10 +95,14 @@ class GEDIPredictor30m:
             print(f"Using preprocessed cache: {self.preprocessed_dir}")
         if self.subset_fraction is not None:
             print(f"Subset fraction: {self.subset_fraction} (seed={self.subset_seed})")
+        if self.stratified_sample_fraction is not None:
+            print(f"Stratified sample fraction: {self.stratified_sample_fraction} "
+                  f"(seed={self.stratified_sample_seed}, splits={sorted(self.stratified_splits)})")
 
         self.model = None
         self.feature_names = None
-        self._subset_tile_ids = {}  # populated on first use per split
+        self._subset_tile_ids = {}       # populated on first use per split
+        self._stratified_sample_info = {}  # populated when stratified sampling is used
 
     def _setup_logging(self):
         self.logger = logging.getLogger('GEDIPredictor30m')
@@ -254,6 +271,11 @@ class GEDIPredictor30m:
 
         When self.preprocessed_dir is set, reads .npz cache files written by
         preprocess_olmo_to_gedi_tiles.py instead of re-loading zarr + rasterio.
+
+        When stratified_sample_fraction is also set and preprocessed_dir is
+        available, uses a two-pass approach: pass 1 reads only y to build the
+        height index; stratified sampling selects (tile, pixel) pairs; pass 2
+        reads X only for those rows. Peak memory stays at ~10% of full dataset.
         """
         tiles = self.gdf[self.gdf['split'] == split_name]['healpix_id'].values
         if self.subset_fraction is not None and self.subset_fraction < 1.0:
@@ -271,6 +293,11 @@ class GEDIPredictor30m:
         n_tiles = len(tiles)
         print(f"\nPreparing '{split_name}' data from {n_tiles} tiles...")
         self.logger.info(f"Preparing '{split_name}' split from {n_tiles} tiles")
+
+        if (self.stratified_sample_fraction is not None
+                and split_name in self.stratified_splits
+                and self.preprocessed_dir is not None):
+            return self._prepare_split_stratified_two_pass(tiles, split_name)
 
         X_list, y_list = [], []
         loaded, skipped = 0, 0
@@ -338,6 +365,9 @@ class GEDIPredictor30m:
         X = np.vstack(X_list)
         y = np.concatenate(y_list)
         print(f"  Stack took {time.time() - stack_start:.1f}s")
+
+        if self.stratified_sample_fraction is not None and split_name in self.stratified_splits:
+            X, y = self._apply_stratified_sample(X, y, split_name)
 
         total_elapsed = time.time() - split_start
         print(f"  {loaded}/{n_tiles} tiles loaded, {skipped} skipped  (total {total_elapsed:.0f}s)")
@@ -489,6 +519,202 @@ class GEDIPredictor30m:
         print(f"Saved subset tile IDs: {out}")
         self.logger.info(f"Saved subset tile IDs: {out}")
 
+    def _prepare_split_stratified_two_pass(self, tiles, split_name):
+        """
+        Stratified sampling for the preprocessed (.npz) path using two passes.
+
+        Pass 1 — read only y per tile to build a global height index; never
+                  touches X, so cost is proportional to n_pixels not n_features.
+        Sample  — stratified selection of (tile, local_pixel_idx) pairs.
+        Pass 2 — read X only for tiles that have selected pixels, extract rows.
+
+        Peak memory: one tile's X at a time + the final selected rows.
+        """
+        bin_edges  = [0, 10, 20, 30, 40, 50, 60, np.inf]
+        bin_labels = ['0-10', '10-20', '20-30', '30-40', '40-50', '50-60', '60+']
+
+        # ----- Pass 1: scan y only -----
+        print(f"  [Pass 1/{split_name}] Scanning heights across {len(tiles)} tiles...")
+        pass1_start = time.time()
+
+        tile_ids_per_pixel = []
+        local_idxs_per_pixel = []
+        y_parts = []
+
+        for healpix_id in tqdm(tiles, desc=f"Pass 1 [{split_name}]"):
+            cache_path = (
+                self.preprocessed_dir
+                / f"healpix_{healpix_id}_{self.embedding_format}.npz"
+            )
+            if not cache_path.exists():
+                self.logger.warning(f"Cache missing for tile {healpix_id}: {cache_path}")
+                continue
+            npz = np.load(cache_path)   # lazy: only loads arrays on access
+            y_tile = npz['y']
+            if len(y_tile) == 0:
+                continue
+            n = len(y_tile)
+            tile_ids_per_pixel.append(np.full(n, healpix_id, dtype=np.int64))
+            local_idxs_per_pixel.append(np.arange(n, dtype=np.int32))
+            y_parts.append(y_tile)
+
+        if not y_parts:
+            print(f"Warning: No valid data for '{split_name}' split")
+            self.logger.warning(f"No valid data for '{split_name}' split")
+            return None, None
+
+        all_tile_ids  = np.concatenate(tile_ids_per_pixel)
+        all_local_idx = np.concatenate(local_idxs_per_pixel)
+        all_y         = np.concatenate(y_parts)
+        print(f"  Pass 1 done: {len(all_y):,} pixels in {time.time() - pass1_start:.1f}s")
+        self.logger.info(f"[{split_name}] Pass 1: {len(all_y):,} pixels scanned")
+
+        # ----- Stratified sampling -----
+        rng = np.random.default_rng(self.stratified_sample_seed)
+        per_bin_before, per_bin_after = {}, {}
+        selected = []
+
+        for (lo, hi), label in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels):
+            idx = np.where((all_y >= lo) & (all_y < hi))[0]
+            n_before = len(idx)
+            per_bin_before[label] = n_before
+            if n_before == 0:
+                per_bin_after[label] = 0
+                continue
+            n_after = max(1, int(round(n_before * self.stratified_sample_fraction)))
+            chosen = rng.choice(idx, size=min(n_after, n_before), replace=False)
+            selected.append(chosen)
+            per_bin_after[label] = len(chosen)
+
+        if not selected:
+            print(f"Warning: No samples selected for '{split_name}'")
+            return None, None
+
+        sel_global_idx = np.concatenate(selected)
+        self._stratified_sample_info[split_name] = {
+            'fraction': self.stratified_sample_fraction,
+            'seed': self.stratified_sample_seed,
+            'n_before': int(len(all_y)),
+            'n_after': int(len(sel_global_idx)),
+            'per_bin_before': per_bin_before,
+            'per_bin_after': per_bin_after,
+        }
+
+        print(f"  Stratified sampling '{split_name}': {len(all_y):,} -> {len(sel_global_idx):,} samples")
+        for label in bin_labels:
+            b = per_bin_before[label]
+            a = per_bin_after.get(label, 0)
+            print(f"    [{label:6s}] {b:>10,} -> {a:>10,}")
+        self.logger.info(f"Stratified sample '{split_name}': {per_bin_before} -> {per_bin_after}")
+
+        # Group selected indices by tile for sequential I/O in pass 2
+        sel_tile_ids  = all_tile_ids[sel_global_idx]
+        sel_local_idx = all_local_idx[sel_global_idx]
+        sel_y         = all_y[sel_global_idx]
+
+        sort_order    = np.argsort(sel_tile_ids, kind='stable')
+        sel_tile_ids  = sel_tile_ids[sort_order]
+        sel_local_idx = sel_local_idx[sort_order]
+        sel_y         = sel_y[sort_order]
+
+        # ----- Pass 2: load X only for selected rows -----
+        unique_tiles, tile_starts = np.unique(sel_tile_ids, return_index=True)
+        tile_ends = np.append(tile_starts[1:], len(sel_tile_ids))
+
+        print(f"  [Pass 2/{split_name}] Loading X from {len(unique_tiles)} tiles...")
+        pass2_start = time.time()
+
+        X_list, y_list_out = [], []
+        for tile_id, start, end in tqdm(
+                zip(unique_tiles, tile_starts, tile_ends),
+                total=len(unique_tiles),
+                desc=f"Pass 2 [{split_name}]"):
+            cache_path = (
+                self.preprocessed_dir
+                / f"healpix_{tile_id}_{self.embedding_format}.npz"
+            )
+            npz = np.load(cache_path)
+            X_tile = npz['X']
+            local  = sel_local_idx[start:end]
+            X_list.append(X_tile[local])
+            y_list_out.append(sel_y[start:end])
+
+        X = np.vstack(X_list)
+        y = np.concatenate(y_list_out)
+        print(f"  Pass 2 done: {X.shape[0]:,} samples, {X.shape[1]} features "
+              f"in {time.time() - pass2_start:.1f}s")
+        self.logger.info(
+            f"[{split_name}] Pass 2: {X.shape[0]:,} samples from {len(unique_tiles)} tiles"
+        )
+
+        # Shuffle to remove tile-ordering bias before training
+        shuffle_idx = np.random.default_rng(self.stratified_sample_seed + 1).permutation(len(y))
+        X = X[shuffle_idx]
+        y = y[shuffle_idx]
+
+        total_elapsed = time.time() - pass1_start
+        print(f"  Samples: {X.shape[0]:,}, Features: {X.shape[1]}")
+        print(f"  Height range: [{y.min():.2f}, {y.max():.2f}] m  mean={y.mean():.2f}")
+        print(f"  Two-pass total: {total_elapsed:.0f}s")
+        self.logger.info(
+            f"[{split_name}] Two-pass stratified complete: {X.shape[0]:,} samples in {total_elapsed:.0f}s"
+        )
+        return X, y
+
+    def _apply_stratified_sample(self, X, y, split_name):
+        """Sample self.stratified_sample_fraction of pixels from each 10 m height bin."""
+        bin_edges  = [0, 10, 20, 30, 40, 50, 60, np.inf]
+        bin_labels = ['0-10', '10-20', '20-30', '30-40', '40-50', '50-60', '60+']
+        rng = np.random.default_rng(self.stratified_sample_seed)
+
+        per_bin_before, per_bin_after = {}, {}
+        selected = []
+
+        for (lo, hi), label in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels):
+            idx = np.where((y >= lo) & (y < hi))[0]
+            n_before = len(idx)
+            per_bin_before[label] = n_before
+            if n_before == 0:
+                per_bin_after[label] = 0
+                continue
+            n_after = max(1, int(round(n_before * self.stratified_sample_fraction)))
+            chosen = rng.choice(idx, size=min(n_after, n_before), replace=False)
+            selected.append(chosen)
+            per_bin_after[label] = len(chosen)
+
+        all_idx = np.concatenate(selected) if selected else np.array([], dtype=int)
+        rng.shuffle(all_idx)
+
+        self._stratified_sample_info[split_name] = {
+            'fraction': self.stratified_sample_fraction,
+            'seed': self.stratified_sample_seed,
+            'n_before': int(len(y)),
+            'n_after': int(len(all_idx)),
+            'per_bin_before': per_bin_before,
+            'per_bin_after': per_bin_after,
+        }
+
+        print(f"  Stratified sampling '{split_name}': {len(y):,} -> {len(all_idx):,} samples")
+        for label in bin_labels:
+            b = per_bin_before[label]
+            a = per_bin_after.get(label, 0)
+            print(f"    [{label:6s}] {b:>10,} -> {a:>10,}")
+        self.logger.info(
+            f"Stratified sample '{split_name}': {per_bin_before} -> {per_bin_after}"
+        )
+
+        return X[all_idx], y[all_idx]
+
+    def save_stratified_sample_info(self):
+        """Write per-bin sample counts to JSON for experiment reproducibility."""
+        if not self._stratified_sample_info:
+            return
+        out = self.output_dir / 'stratified_sample_info.json'
+        with open(out, 'w') as f:
+            json.dump(self._stratified_sample_info, f, indent=2)
+        print(f"Saved stratified sample info: {out}")
+        self.logger.info(f"Saved stratified sample info: {out}")
+
     def save_metrics(self, metrics, filename='metrics.json'):
         path = self.output_dir / filename
         with open(path, 'w') as f:
@@ -547,6 +773,18 @@ def main():
                              'Selected tile IDs are saved to subset_tiles.json.')
     parser.add_argument('--subset-seed', type=int, default=42,
                         help='Random seed for subset tile sampling (default: 42)')
+    parser.add_argument('--stratified-sample-fraction', type=float, default=None,
+                        help='After loading all tiles, sample this fraction of pixels per '
+                             '10 m height bin (0–10, 10–20, …, 60+), stratified by GEDI '
+                             'ground-truth height. Applied to splits listed in '
+                             '--stratified-splits. Per-bin counts saved to '
+                             'stratified_sample_info.json. '
+                             'Use to investigate representativeness vs. data volume.')
+    parser.add_argument('--stratified-sample-seed', type=int, default=42,
+                        help='Random seed for stratified pixel sampling (default: 42)')
+    parser.add_argument('--stratified-splits', nargs='+', default=['train'],
+                        metavar='SPLIT',
+                        help='Which splits to apply stratified sampling to (default: train)')
 
     args = parser.parse_args()
 
@@ -559,6 +797,9 @@ def main():
         preprocessed_dir=args.preprocessed_dir,
         subset_fraction=args.subset_fraction,
         subset_seed=args.subset_seed,
+        stratified_sample_fraction=args.stratified_sample_fraction,
+        stratified_sample_seed=args.stratified_sample_seed,
+        stratified_splits=args.stratified_splits,
     )
 
     train_metrics = predictor.train(
@@ -584,6 +825,7 @@ def main():
     predictor.save_model()
     predictor.save_metrics(all_metrics)
     predictor.save_subset_tiles()
+    predictor.save_stratified_sample_info()
 
     print("\n" + "=" * 50)
     print("Complete!")
