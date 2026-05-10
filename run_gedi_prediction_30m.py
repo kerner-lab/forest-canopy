@@ -318,6 +318,8 @@ class GEDIPredictor30m:
                 if cache_path.exists():
                     npz = np.load(cache_path)
                     X_tile, y_tile = npz['X'], npz['y']
+                    if self.embedding_format == 'int8' and X_tile.dtype == np.int8:
+                        X_tile = X_tile.astype(np.float32) / 127.0
                 else:
                     self.logger.warning(f"Cache missing for tile {healpix_id}: {cache_path}")
                     X_tile, y_tile = None, None
@@ -635,6 +637,8 @@ class GEDIPredictor30m:
             )
             npz = np.load(cache_path)
             X_tile = npz['X']
+            if self.embedding_format == 'int8' and X_tile.dtype == np.int8:
+                X_tile = X_tile.astype(np.float32) / 127.0
             local  = sel_local_idx[start:end]
             X_list.append(X_tile[local])
             y_list_out.append(sel_y[start:end])

@@ -72,7 +72,7 @@ def load_embeddings(healpix_id, embeddings_dir, embedding_format, logger):
             return None
         embeddings = np.transpose(embeddings, (1, 2, 0))  # -> (H, W, C)
         if embedding_format == 'int8':
-            embeddings = embeddings.astype(np.float32) / 127.0
+            embeddings = embeddings.astype(np.int8)   # keep raw int8; training normalises
         else:
             embeddings = embeddings.astype(np.float32)
         return embeddings
