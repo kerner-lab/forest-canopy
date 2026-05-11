@@ -292,8 +292,11 @@ def main():
                     (gedi_dir / f"healpix_{hid}_gedi{ext}").exists()
                     for ext in ('.tif', '.tiff', '')
                 )
-                skip_reason = "missing_gedi" if not gedi_found else "no_valid_pixels"
-                missing_gedi.append(int(hid))
+                if not gedi_found:
+                    skip_reason = "missing_gedi"
+                    missing_gedi.append(int(hid))
+                else:
+                    skip_reason = "no_valid_pixels"
             logger.info(f"Tile {hid}: skipped [{skip_reason}]")
             continue
 

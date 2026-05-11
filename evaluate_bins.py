@@ -85,38 +85,65 @@ def _bin_metrics(gedi_arr, pred_arr, lo, hi):
 
 def _scatter_subplot(ax, g, p, label, subsample_factor):
     if len(g) < 2:
-        ax.set_title(f'{label}\n(n={len(g)}, insufficient data)')
-        ax.set_xlabel('GEDI rh98 (m)')
-        ax.set_ylabel('Predicted (m)')
+        ax.set_title(f'{label}  (n={len(g)}, insufficient data)', fontsize=8)
+        ax.set_xlabel('Ground Truth GEDI rh98 (unit: m)', fontsize=7)
+        ax.set_ylabel('Predicted GEDI rh98 (unit: m)', fontsize=7)
         return
 
-    n_full = len(g)
+    # Compute metrics on full data before any subsampling
     rmse = np.sqrt(mean_squared_error(g, p))
     r, _ = stats.pearsonr(g, p)
-    bias = np.mean(p - g)
 
-    lo = min(g.min(), p.min())
-    hi = max(g.max(), p.max())
-    ax.plot([lo, hi], [lo, hi], '--', color='gray', linewidth=1)
+    min_value = min(g.min(), p.min())
+    max_value = max(g.max(), p.max())
 
-    if len(g) > 5000:
+    # Perfect prediction line
+    ax.plot([min_value, max_value], [min_value, max_value], '--', color='gray', linewidth=1)
+
+    # Subsample for plotting (matches evaluate.py threshold and factor)
+    if len(g) > 10000:
         g = g[::subsample_factor]
         p = p[::subsample_factor]
 
+    # KDE density scatter
     try:
         xy = np.vstack([g, p])
         z = stats.gaussian_kde(xy)(xy)
         idx = z.argsort()
-        ax.scatter(g[idx], p[idx], c=z[idx], cmap='jet', s=2, rasterized=True)
+        sc = ax.scatter(g[idx], p[idx], c=z[idx], cmap='jet',
+                        label='RMSE = %.3f\nPearson correlation = %.3f' % (rmse, r),
+                        s=0.5)
+        cbar = plt.colorbar(sc, ax=ax)
+        cbar.set_ticks([])
     except Exception:
-        ax.scatter(g, p, s=2, alpha=0.3)
+        ax.scatter(g, p, s=0.5, alpha=0.3,
+                   label='RMSE = %.3f\nPearson correlation = %.3f' % (rmse, r))
 
-    ax.set_title(
-        f'{label}  (n={n_full:,})\n'
-        f'RMSE={rmse:.2f} m   r={r:.3f}   bias={bias:+.2f} m',
-        fontsize=8)
-    ax.set_xlabel('GEDI rh98 (m)', fontsize=7)
-    ax.set_ylabel('Predicted (m)', fontsize=7)
+    # Regression line
+    coef = np.polyfit(g, p, 1)
+    poly1d = np.poly1d(coef)
+    ax.plot(g, poly1d(g), '--', color='black', linewidth=1,
+            label=f'Regression line (slope={coef[0]:.2f})')
+
+    # Binned mean ± std (1 m bins, matching evaluate.py)
+    bins = np.linspace(min_value, max_value,
+                       int(np.ceil((max_value - min_value) / 1)))
+    if len(bins) > 1:
+        digitized = np.digitize(g, bins)
+        x_means = np.array([g[digitized == i].mean() for i in range(1, len(bins))])
+        y_means = np.array([p[digitized == i].mean() for i in range(1, len(bins))])
+        y_stds  = np.array([p[digitized == i].std()  for i in range(1, len(bins))])
+        ax.plot(x_means, y_means, '--', color='mediumvioletred', linewidth=1,
+                label='Binned prediction mean and std')
+        ax.fill_between(x_means, y_means - y_stds, y_means + y_stds,
+                        alpha=0.3, edgecolor='deeppink', facecolor='hotpink')
+
+    ax.set_xlabel('Ground Truth GEDI rh98 (unit: m)', fontsize=7)
+    ax.set_ylabel('Predicted GEDI rh98 (unit: m)', fontsize=7)
+    ax.set_xlim((min_value, max_value))
+    ax.set_ylim((min_value, max_value))
+    ax.legend(loc='upper right', fontsize=6)
+    ax.set_title(label, fontsize=8)
     ax.tick_params(labelsize=7)
 
 
