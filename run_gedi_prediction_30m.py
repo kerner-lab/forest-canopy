@@ -37,7 +37,7 @@ class GEDIPredictor30m:
 
     def __init__(self, shapefile_path, gedi_dir, embeddings_dir, output_dir,
                  embedding_format='float32', preprocessed_dir=None,
-                 subset_fraction=None, subset_seed=42,
+                 subset_fraction=None, subset_seed=42, subset_splits=None,
                  stratified_sample_fraction=None, stratified_sample_seed=42,
                  stratified_splits=None):
         """
@@ -50,8 +50,9 @@ class GEDIPredictor30m:
             preprocessed_dir: Optional path to .npz cache from preprocess_olmo_to_gedi_tiles.py.
                                When set, zarr/rasterio loading is skipped entirely.
             subset_fraction: If set (0 < float <= 1), randomly sample this fraction of tiles
-                             per split. Tile IDs are saved to subset_tiles.json for reproducibility.
+                             for splits listed in subset_splits. Tile IDs saved to subset_tiles.json.
             subset_seed: Random seed used for subset sampling (default: 42).
+            subset_splits: List of split names to apply tile subsetting to (default: ['train']).
             stratified_sample_fraction: If set (any truthy value triggers activation), equalizes
                                         10 m height bins by capping each bin at the smallest
                                         bin's pixel count (stratified by GEDI ground-truth height).
@@ -74,6 +75,7 @@ class GEDIPredictor30m:
         self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
         self.subset_fraction = subset_fraction
         self.subset_seed = subset_seed
+        self.subset_splits = set(subset_splits) if subset_splits else {'train'}
         self.stratified_sample_fraction = stratified_sample_fraction
         self.stratified_sample_seed = stratified_sample_seed
         self.stratified_splits = set(stratified_splits) if stratified_splits else {'train'}
@@ -278,7 +280,8 @@ class GEDIPredictor30m:
         reads X only for those rows. Peak memory stays at ~10% of full dataset.
         """
         tiles = self.gdf[self.gdf['split'] == split_name]['healpix_id'].values
-        if self.subset_fraction is not None and self.subset_fraction < 1.0:
+        if (self.subset_fraction is not None and self.subset_fraction < 1.0
+                and split_name in self.subset_splits):
             rng = np.random.default_rng(self.subset_seed)
             n_subset = max(1, int(round(len(tiles) * self.subset_fraction)))
             tiles = rng.choice(tiles, size=n_subset, replace=False)
@@ -784,6 +787,9 @@ def main():
                              'Selected tile IDs are saved to subset_tiles.json.')
     parser.add_argument('--subset-seed', type=int, default=42,
                         help='Random seed for subset tile sampling (default: 42)')
+    parser.add_argument('--subset-splits', nargs='+', default=['train'],
+                        metavar='SPLIT',
+                        help='Which splits to apply tile subsetting to (default: train)')
     parser.add_argument('--stratified-sample-fraction', type=float, default=None,
                         help='Enable equalized stratified sampling across 10 m height bins '
                              '(0–10, 10–20, …, 60+). Each bin is capped at the smallest '
@@ -808,6 +814,7 @@ def main():
         preprocessed_dir=args.preprocessed_dir,
         subset_fraction=args.subset_fraction,
         subset_seed=args.subset_seed,
+        subset_splits=args.subset_splits,
         stratified_sample_fraction=args.stratified_sample_fraction,
         stratified_sample_seed=args.stratified_sample_seed,
         stratified_splits=args.stratified_splits,
