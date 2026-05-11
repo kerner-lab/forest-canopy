@@ -264,6 +264,7 @@ def main():
     n_failed = 0
     missing_embeddings = []
     missing_gedi = []
+    failed_tiles = {}  # hid -> reason
     total_samples = 0
     start = time.time()
 
@@ -297,7 +298,8 @@ def main():
                     missing_gedi.append(int(hid))
                 else:
                     skip_reason = "no_valid_pixels"
-            logger.info(f"Tile {hid}: skipped [{skip_reason}]")
+            failed_tiles[int(hid)] = skip_reason
+            logger.warning(f"Tile {hid}: failed [{skip_reason}]")
             continue
 
         np.savez_compressed(cache_path, X=X, y=y)
@@ -319,6 +321,9 @@ def main():
     print(f"  Processed : {n_processed} tiles  ({total_samples:,} total samples)")
     print(f"  Skipped   : {n_skipped} tiles (already cached)")
     print(f"  Failed    : {n_failed} tiles")
+    if failed_tiles:
+        for hid, reason in sorted(failed_tiles.items()):
+            print(f"    Tile {hid}: {reason}")
     if missing_embeddings:
         print(f"  Missing embeddings: {missing_embeddings}")
     if missing_gedi:
@@ -336,6 +341,7 @@ def main():
         'splits': args.splits,
         'missing_embeddings': missing_embeddings,
         'missing_gedi': missing_gedi,
+        'failed_tiles': failed_tiles,
     }
     splits_tag = "_".join(args.splits)
     summary_path = output_dir / f'preprocess_summary_{splits_tag}.json'
