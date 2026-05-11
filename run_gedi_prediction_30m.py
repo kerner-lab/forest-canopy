@@ -52,10 +52,10 @@ class GEDIPredictor30m:
             subset_fraction: If set (0 < float <= 1), randomly sample this fraction of tiles
                              per split. Tile IDs are saved to subset_tiles.json for reproducibility.
             subset_seed: Random seed used for subset sampling (default: 42).
-            stratified_sample_fraction: If set (0 < float <= 1), after loading all tile data for
-                                        a split, sample this fraction of pixels per 10 m height bin
-                                        (stratified by GEDI ground-truth height). Saves per-bin
-                                        counts to stratified_sample_info.json.
+            stratified_sample_fraction: If set (any truthy value triggers activation), equalizes
+                                        10 m height bins by capping each bin at the smallest
+                                        bin's pixel count (stratified by GEDI ground-truth height).
+                                        Saves per-bin counts to stratified_sample_info.json.
             stratified_sample_seed: Random seed for stratified pixel sampling (default: 42).
             stratified_splits: List of split names to apply stratified sampling to (default: ['train']).
         """
@@ -571,20 +571,24 @@ class GEDIPredictor30m:
         print(f"  Pass 1 done: {len(all_y):,} pixels in {time.time() - pass1_start:.1f}s")
         self.logger.info(f"[{split_name}] Pass 1: {len(all_y):,} pixels scanned")
 
-        # ----- Stratified sampling -----
+        # ----- Stratified sampling: equalize bins by capping at smallest bin -----
         rng = np.random.default_rng(self.stratified_sample_seed)
         per_bin_before, per_bin_after = {}, {}
-        selected = []
 
+        bin_indices = {}
         for (lo, hi), label in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels):
             idx = np.where((all_y >= lo) & (all_y < hi))[0]
-            n_before = len(idx)
-            per_bin_before[label] = n_before
-            if n_before == 0:
+            per_bin_before[label] = len(idx)
+            if len(idx) > 0:
+                bin_indices[label] = idx
+
+        cap = min(len(idx) for idx in bin_indices.values()) if bin_indices else 1
+        selected = []
+        for label in bin_labels:
+            if label not in bin_indices:
                 per_bin_after[label] = 0
                 continue
-            n_after = max(1, int(round(n_before * self.stratified_sample_fraction)))
-            chosen = rng.choice(idx, size=min(n_after, n_before), replace=False)
+            chosen = rng.choice(bin_indices[label], size=cap, replace=False)
             selected.append(chosen)
             per_bin_after[label] = len(chosen)
 
@@ -594,7 +598,7 @@ class GEDIPredictor30m:
 
         sel_global_idx = np.concatenate(selected)
         self._stratified_sample_info[split_name] = {
-            'fraction': self.stratified_sample_fraction,
+            'cap_per_bin': cap,
             'seed': self.stratified_sample_seed,
             'n_before': int(len(all_y)),
             'n_after': int(len(sel_global_idx)),
@@ -602,7 +606,7 @@ class GEDIPredictor30m:
             'per_bin_after': per_bin_after,
         }
 
-        print(f"  Stratified sampling '{split_name}': {len(all_y):,} -> {len(sel_global_idx):,} samples")
+        print(f"  Stratified sampling '{split_name}': {len(all_y):,} -> {len(sel_global_idx):,} samples (cap={cap:,}/bin)")
         for label in bin_labels:
             b = per_bin_before[label]
             a = per_bin_after.get(label, 0)
@@ -666,23 +670,26 @@ class GEDIPredictor30m:
         return X, y
 
     def _apply_stratified_sample(self, X, y, split_name):
-        """Sample self.stratified_sample_fraction of pixels from each 10 m height bin."""
+        """Equalize bins by capping each 10 m height bin at the smallest bin's count."""
         bin_edges  = [0, 10, 20, 30, 40, 50, 60, np.inf]
         bin_labels = ['0-10', '10-20', '20-30', '30-40', '40-50', '50-60', '60+']
         rng = np.random.default_rng(self.stratified_sample_seed)
 
         per_bin_before, per_bin_after = {}, {}
-        selected = []
-
+        bin_indices = {}
         for (lo, hi), label in zip(zip(bin_edges[:-1], bin_edges[1:]), bin_labels):
             idx = np.where((y >= lo) & (y < hi))[0]
-            n_before = len(idx)
-            per_bin_before[label] = n_before
-            if n_before == 0:
+            per_bin_before[label] = len(idx)
+            if len(idx) > 0:
+                bin_indices[label] = idx
+
+        cap = min(len(idx) for idx in bin_indices.values()) if bin_indices else 1
+        selected = []
+        for label in bin_labels:
+            if label not in bin_indices:
                 per_bin_after[label] = 0
                 continue
-            n_after = max(1, int(round(n_before * self.stratified_sample_fraction)))
-            chosen = rng.choice(idx, size=min(n_after, n_before), replace=False)
+            chosen = rng.choice(bin_indices[label], size=cap, replace=False)
             selected.append(chosen)
             per_bin_after[label] = len(chosen)
 
@@ -690,7 +697,7 @@ class GEDIPredictor30m:
         rng.shuffle(all_idx)
 
         self._stratified_sample_info[split_name] = {
-            'fraction': self.stratified_sample_fraction,
+            'cap_per_bin': cap,
             'seed': self.stratified_sample_seed,
             'n_before': int(len(y)),
             'n_after': int(len(all_idx)),
@@ -698,7 +705,7 @@ class GEDIPredictor30m:
             'per_bin_after': per_bin_after,
         }
 
-        print(f"  Stratified sampling '{split_name}': {len(y):,} -> {len(all_idx):,} samples")
+        print(f"  Stratified sampling '{split_name}': {len(y):,} -> {len(all_idx):,} samples (cap={cap:,}/bin)")
         for label in bin_labels:
             b = per_bin_before[label]
             a = per_bin_after.get(label, 0)
@@ -778,12 +785,12 @@ def main():
     parser.add_argument('--subset-seed', type=int, default=42,
                         help='Random seed for subset tile sampling (default: 42)')
     parser.add_argument('--stratified-sample-fraction', type=float, default=None,
-                        help='After loading all tiles, sample this fraction of pixels per '
-                             '10 m height bin (0–10, 10–20, …, 60+), stratified by GEDI '
-                             'ground-truth height. Applied to splits listed in '
-                             '--stratified-splits. Per-bin counts saved to '
-                             'stratified_sample_info.json. '
-                             'Use to investigate representativeness vs. data volume.')
+                        help='Enable equalized stratified sampling across 10 m height bins '
+                             '(0–10, 10–20, …, 60+). Each bin is capped at the smallest '
+                             'bin\'s pixel count so all bins contribute equally. Applied to '
+                             'splits in --stratified-splits. Pass any non-zero value to '
+                             'activate (the value itself is ignored). Per-bin counts saved '
+                             'to stratified_sample_info.json.')
     parser.add_argument('--stratified-sample-seed', type=int, default=42,
                         help='Random seed for stratified pixel sampling (default: 42)')
     parser.add_argument('--stratified-splits', nargs='+', default=['train'],
