@@ -36,6 +36,7 @@ SHAPEFILE=/scratch/kdoerkse/olmo/healpix_shapefile.shp
 GEDI_DIR=/scratch/kdoerkse/olmo/gedi
 EMBEDDINGS_DIR=/scratch/kdoerkse/olmo/california_embeddings_30m_reproj
 EMBEDDING_FORMAT=float32   # float32 or int8
+YEAR=2021
 N_ESTIMATORS=100
 MAX_DEPTH=               # leave blank for unlimited
 OUTPUT_DIR=/scratch/kdoerkse/olmo/outputs_gedi_rf_30m_${EMBEDDING_FORMAT}_$(date +%Y%m%d_%H%M%S)
@@ -61,6 +62,7 @@ python -u run_gedi_prediction_30m.py \
     --embeddings-dir   "${EMBEDDINGS_DIR}" \
     --output-dir       "${OUTPUT_DIR}" \
     --embedding-format "${EMBEDDING_FORMAT}" \
+    --year             "${YEAR}" \
     --n-estimators     "${N_ESTIMATORS}" \
     --min-samples-split 2 \
     ${DEPTH_ARG}

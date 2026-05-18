@@ -779,9 +779,14 @@ def main():
     parser.add_argument('--random-state', type=int, default=42)
     parser.add_argument('--max-tiles', type=int, default=None,
                         help='Limit tiles per split (for pipeline testing)')
+    parser.add_argument('--year', type=int, default=None,
+                        help='Year of the GEDI data query (e.g. 2021). When --preprocessed-dir '
+                             'is not set, auto-constructs it as '
+                             '{embeddings-dir}/{year}/gedi_cache_30m_{embedding-format}.')
     parser.add_argument('--preprocessed-dir', default=None,
                         help='Path to .npz cache from preprocess_olmo_to_gedi_tiles.py. '
-                             'When set, skips zarr/rasterio loading entirely.')
+                             'When set, skips zarr/rasterio loading entirely. '
+                             'If omitted and --year is provided, the path is auto-constructed.')
     parser.add_argument('--subset-fraction', type=float, default=None,
                         help='Randomly sample this fraction (0, 1] of tiles per split. '
                              'Selected tile IDs are saved to subset_tiles.json.')
@@ -804,6 +809,13 @@ def main():
                         help='Which splits to apply stratified sampling to (default: train)')
 
     args = parser.parse_args()
+
+    if args.preprocessed_dir is None and args.year is not None:
+        args.preprocessed_dir = str(
+            Path(args.embeddings_dir) / str(args.year)
+            / f"gedi_cache_30m_{args.embedding_format}"
+        )
+        print(f"Auto-constructed preprocessed-dir for year {args.year}: {args.preprocessed_dir}")
 
     predictor = GEDIPredictor30m(
         shapefile_path=args.shapefile,
