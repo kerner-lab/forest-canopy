@@ -968,6 +968,7 @@ def main():
         'test': test_metrics,
         'embedding_format': args.embedding_format,
         'model': args.model,
+        'year': args.year,
     }
 
     predictor.plot_feature_importance(top_n=30)
@@ -978,7 +979,7 @@ def main():
     predictor.save_stratified_sample_info()
 
     print("\n" + "=" * 50)
-    print(f"Complete!  model={args.model.upper()}  format={args.embedding_format}")
+    print(f"Complete!  model={args.model.upper()}  format={args.embedding_format}  year={args.year}")
     print(f"  Train R²: {train_metrics['train']['r2']:.3f}")
     if val_metrics:
         print(f"  Val   R²: {val_metrics['r2']:.3f}")
