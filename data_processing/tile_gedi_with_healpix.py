@@ -262,9 +262,9 @@ def verify_tile_output(output_dir: str, tile_ids: List[int] = None):
 if __name__ == "__main__":
     data_dir = '/Users/kdoerkse/Documents/ASU/JPL/data'
 
-    GEDI_TIF = "{}/gedi_rh98_30.0m_2021.tif".format(data_dir)
-    HEALPIX_SHAPEFILE = "{}/healpix_shapefile.shp".format(data_dir)
-    OUTPUT_DIR = "{}/gedi_tiles".format(data_dir)
+    GEDI_TIF = "{}/gedi_rh98_30.0m_2020.tif".format(data_dir)
+    HEALPIX_SHAPEFILE = "{}/shapefiles/healpix_shapefile.shp".format(data_dir)
+    OUTPUT_DIR = "{}/gedi_tiles_2020_healpix".format(data_dir)
 
     TILE_ID_COLUMN = 'healpix_id'
     gdf = gpd.read_file(HEALPIX_SHAPEFILE)

@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Random Forest Model for GEDI Canopy Height Prediction using OLMo-Earth 30m Embeddings
+ML Models for GEDI Canopy Height Prediction using OLMo-Earth 30m Embeddings
+
+Supports four model architectures selectable via --model:
+  rf  — Random Forest Regressor (default)
+  xgb — XGBoost Regressor (requires xgboost package)
+  gb  — Gradient Boosting Regressor
+  lr  — Logistic Regression (discretises heights into --lr-bin-size bins)
 
 Embeddings are already reprojected to the healpix tile grid (same CRS/extent as GEDI tifs),
 so pixel indices align directly — no coordinate reprojection needed.
@@ -14,8 +20,14 @@ import pandas as pd
 import geopandas as gpd
 import rasterio
 import zarr
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+try:
+    from xgboost import XGBRegressor
+    _HAS_XGB = True
+except ImportError:
+    _HAS_XGB = False
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
@@ -39,7 +51,7 @@ class GEDIPredictor30m:
                  embedding_format='float32', preprocessed_dir=None,
                  subset_fraction=None, subset_seed=42, subset_splits=None,
                  stratified_sample_fraction=None, stratified_sample_seed=42,
-                 stratified_splits=None):
+                 stratified_splits=None, model_type='rf'):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -59,7 +71,13 @@ class GEDIPredictor30m:
                                         Saves per-bin counts to stratified_sample_info.json.
             stratified_sample_seed: Random seed for stratified pixel sampling (default: 42).
             stratified_splits: List of split names to apply stratified sampling to (default: ['train']).
+            model_type: One of 'rf', 'xgb', 'gb', 'lr' (default: 'rf').
         """
+        _VALID_MODELS = ('rf', 'xgb', 'gb', 'lr')
+        if model_type not in _VALID_MODELS:
+            raise ValueError(f"model_type must be one of {_VALID_MODELS}")
+        if model_type == 'xgb' and not _HAS_XGB:
+            raise ImportError("xgboost is required for model_type='xgb'. Install with: pip install xgboost")
         if embedding_format not in ('float32', 'int8'):
             raise ValueError("embedding_format must be 'float32' or 'int8'")
         if subset_fraction is not None and not (0 < subset_fraction <= 1):
@@ -101,10 +119,13 @@ class GEDIPredictor30m:
             print(f"Stratified sample fraction: {self.stratified_sample_fraction} "
                   f"(seed={self.stratified_sample_seed}, splits={sorted(self.stratified_splits)})")
 
+        self.model_type = model_type
         self.model = None
         self.feature_names = None
         self._subset_tile_ids = {}       # populated on first use per split
         self._stratified_sample_info = {}  # populated when stratified sampling is used
+        self._lr_bin_edges = None        # set during LR training
+        self._lr_bin_centers = None
 
     def _setup_logging(self):
         self.logger = logging.getLogger('GEDIPredictor30m')
@@ -385,32 +406,86 @@ class GEDIPredictor30m:
         return X, y
 
     def train(self, n_estimators=100, max_depth=None, min_samples_split=2,
-              max_features='sqrt', n_jobs=-1, random_state=42, max_tiles=None):
-        """Train the Random Forest on the training split."""
+              max_features='sqrt', n_jobs=-1, random_state=42, max_tiles=None,
+              learning_rate=0.1, subsample=1.0,
+              lr_C=1.0, lr_max_iter=1000, lr_bin_size=5.0):
+        """Train the selected model on the training split."""
         X_train, y_train = self.prepare_split_data('train', max_tiles=max_tiles)
         if X_train is None:
             raise ValueError("No training data available")
 
         self.feature_names = [f"emb_{i}" for i in range(X_train.shape[1])]
+        n_samples = X_train.shape[0]
 
-        print(f"\nTraining Random Forest ({n_estimators} trees, {X_train.shape[0]:,} samples)...")
-        self.logger.info(f"Training RF: {n_estimators} trees, {X_train.shape[0]:,} samples, {X_train.shape[1]} features")
-        self.model = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            min_samples_split=min_samples_split,
-            max_features=max_features,
-            n_jobs=n_jobs,
-            random_state=random_state,
-            verbose=1,
-        )
+        if self.model_type == 'rf':
+            print(f"\nTraining Random Forest ({n_estimators} trees, {n_samples:,} samples)...")
+            self.logger.info(f"Training RF: {n_estimators} trees, {n_samples:,} samples, {X_train.shape[1]} features")
+            self.model = RandomForestRegressor(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                min_samples_split=min_samples_split,
+                max_features=max_features,
+                n_jobs=n_jobs,
+                random_state=random_state,
+                verbose=1,
+            )
+            y_fit = y_train
+
+        elif self.model_type == 'xgb':
+            _depth = max_depth if max_depth is not None else 6
+            print(f"\nTraining XGBoost ({n_estimators} trees, depth={_depth}, lr={learning_rate}, {n_samples:,} samples)...")
+            self.logger.info(f"Training XGBoost: n_estimators={n_estimators}, max_depth={_depth}, lr={learning_rate}")
+            self.model = XGBRegressor(
+                n_estimators=n_estimators,
+                max_depth=_depth,
+                learning_rate=learning_rate,
+                subsample=subsample,
+                n_jobs=n_jobs,
+                random_state=random_state,
+                verbosity=1,
+            )
+            y_fit = y_train
+
+        elif self.model_type == 'gb':
+            _depth = max_depth if max_depth is not None else 3
+            print(f"\nTraining Gradient Boosting ({n_estimators} trees, depth={_depth}, lr={learning_rate}, {n_samples:,} samples)...")
+            self.logger.info(f"Training GB: n_estimators={n_estimators}, max_depth={_depth}, lr={learning_rate}")
+            self.model = GradientBoostingRegressor(
+                n_estimators=n_estimators,
+                max_depth=_depth,
+                min_samples_split=min_samples_split,
+                learning_rate=learning_rate,
+                subsample=subsample,
+                random_state=random_state,
+                verbose=1,
+            )
+            y_fit = y_train
+
+        elif self.model_type == 'lr':
+            bin_edges = np.arange(0, y_train.max() + lr_bin_size, lr_bin_size)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+            self._lr_bin_edges = bin_edges
+            self._lr_bin_centers = bin_centers
+            y_fit = np.clip(np.digitize(y_train, bin_edges) - 1, 0, len(bin_centers) - 1)
+            n_classes = len(bin_centers)
+            print(f"\nTraining Logistic Regression (C={lr_C}, {n_classes} bins of {lr_bin_size}m, {n_samples:,} samples)...")
+            self.logger.info(f"Training LR: C={lr_C}, max_iter={lr_max_iter}, n_classes={n_classes}")
+            self.model = LogisticRegression(
+                C=lr_C,
+                max_iter=lr_max_iter,
+                n_jobs=n_jobs,
+                random_state=random_state,
+            )
+
         train_start = time.time()
-        self.model.fit(X_train, y_train)
+        self.model.fit(X_train, y_fit)
         train_elapsed = time.time() - train_start
-        print(f"RF training took {train_elapsed:.0f}s ({train_elapsed/60:.1f} min)")
-        self.logger.info(f"RF training completed in {train_elapsed:.0f}s")
 
-        y_pred = self.model.predict(X_train)
+        label = {'rf': 'RF', 'xgb': 'XGBoost', 'gb': 'GB', 'lr': 'LR'}[self.model_type]
+        print(f"{label} training took {train_elapsed:.0f}s ({train_elapsed/60:.1f} min)")
+        self.logger.info(f"{label} training completed in {train_elapsed:.0f}s")
+
+        y_pred = self._predict(X_train)
         metrics = {
             'rmse': float(np.sqrt(mean_squared_error(y_train, y_pred))),
             'mae': float(mean_absolute_error(y_train, y_pred)),
@@ -422,6 +497,13 @@ class GEDIPredictor30m:
         self._save_predictions(y_train, y_pred, 'train')
         return {'train': metrics}
 
+    def _predict(self, X):
+        """Predict canopy heights; maps LR class indices to bin-centre heights."""
+        if self.model_type == 'lr':
+            class_preds = self.model.predict(X).astype(int)
+            return self._lr_bin_centers[class_preds]
+        return self.model.predict(X)
+
     def evaluate(self, split_name='val', max_tiles=None):
         """Evaluate trained model on a split."""
         if self.model is None:
@@ -431,7 +513,7 @@ class GEDIPredictor30m:
         if X is None:
             return None
 
-        y_pred = self.model.predict(X)
+        y_pred = self._predict(X)
         metrics = {
             'rmse': float(np.sqrt(mean_squared_error(y, y_pred))),
             'mae': float(mean_absolute_error(y, y_pred)),
@@ -483,13 +565,20 @@ class GEDIPredictor30m:
     def plot_feature_importance(self, top_n=20):
         if self.model is None:
             raise ValueError("Model not trained yet")
-        importances = self.model.feature_importances_
+        if self.model_type == 'lr':
+            importances = np.mean(np.abs(self.model.coef_), axis=0)
+            ylabel = 'Mean |Coefficient|'
+            title = f'Top {top_n} Feature Coefficients (LR, {self.embedding_format})'
+        else:
+            importances = self.model.feature_importances_
+            ylabel = 'Importance'
+            title = f'Top {top_n} Feature Importances ({self.model_type.upper()}, {self.embedding_format})'
         indices = np.argsort(importances)[::-1][:top_n]
         plt.figure(figsize=(10, 6))
         plt.bar(range(top_n), importances[indices])
         plt.xlabel('Embedding Channel Index')
-        plt.ylabel('Importance')
-        plt.title(f'Top {top_n} Feature Importances (30m embeddings, {self.embedding_format})')
+        plt.ylabel(ylabel)
+        plt.title(title)
         plt.xticks(range(top_n), indices, rotation=45)
         plt.tight_layout()
         out = self.output_dir / 'feature_importance.png'
@@ -501,11 +590,19 @@ class GEDIPredictor30m:
         if self.model is None:
             raise ValueError("Model not trained yet")
         if filename is None:
-            filename = f'gedi_rf_30m_{self.embedding_format}.pkl'
+            filename = f'gedi_{self.model_type}_30m_{self.embedding_format}.pkl'
         model_path = self.output_dir / filename
+        payload = {
+            'model': self.model,
+            'feature_names': self.feature_names,
+            'embedding_format': self.embedding_format,
+            'model_type': self.model_type,
+        }
+        if self.model_type == 'lr':
+            payload['lr_bin_edges'] = self._lr_bin_edges
+            payload['lr_bin_centers'] = self._lr_bin_centers
         with open(model_path, 'wb') as f:
-            pickle.dump({'model': self.model, 'feature_names': self.feature_names,
-                         'embedding_format': self.embedding_format}, f)
+            pickle.dump(payload, f)
         print(f"Saved model: {model_path}")
         self.logger.info(f"Saved model: {model_path}")
 
@@ -761,7 +858,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Train Random Forest for GEDI height prediction using 30m OLMo embeddings'
+        description='Train ML model for GEDI height prediction using 30m OLMo embeddings'
     )
     parser.add_argument('--shapefile', required=True,
                         help='Path to healpix shapefile (.shp) with split column')
@@ -773,10 +870,26 @@ def main():
                         help='Output directory for models and results')
     parser.add_argument('--embedding-format', choices=['float32', 'int8'], default='float32',
                         help='Embedding format to load (default: float32)')
+    parser.add_argument('--model', choices=['rf', 'xgb', 'gb', 'lr'], default='rf',
+                        help='Model architecture: rf=RandomForest, xgb=XGBoost, '
+                             'gb=GradientBoosting, lr=LogisticRegression (binned) (default: rf)')
+    # Shared tree params
     parser.add_argument('--n-estimators', type=int, default=100)
     parser.add_argument('--max-depth', type=int, default=None)
     parser.add_argument('--min-samples-split', type=int, default=2)
     parser.add_argument('--random-state', type=int, default=42)
+    # XGBoost / GradientBoosting
+    parser.add_argument('--learning-rate', type=float, default=0.1,
+                        help='Learning rate for xgb or gb (default: 0.1)')
+    parser.add_argument('--subsample', type=float, default=1.0,
+                        help='Row subsample ratio for xgb or gb (default: 1.0)')
+    # Logistic Regression
+    parser.add_argument('--lr-C', type=float, default=1.0,
+                        help='Inverse regularisation strength for LogisticRegression (default: 1.0)')
+    parser.add_argument('--lr-max-iter', type=int, default=1000,
+                        help='Max solver iterations for LogisticRegression (default: 1000)')
+    parser.add_argument('--lr-bin-size', type=float, default=5.0,
+                        help='Height bin size in metres for LR discretisation (default: 5.0)')
     parser.add_argument('--max-tiles', type=int, default=None,
                         help='Limit tiles per split (for pipeline testing)')
     parser.add_argument('--year', type=int, default=None,
@@ -830,6 +943,7 @@ def main():
         stratified_sample_fraction=args.stratified_sample_fraction,
         stratified_sample_seed=args.stratified_sample_seed,
         stratified_splits=args.stratified_splits,
+        model_type=args.model,
     )
 
     train_metrics = predictor.train(
@@ -838,6 +952,11 @@ def main():
         min_samples_split=args.min_samples_split,
         random_state=args.random_state,
         max_tiles=args.max_tiles,
+        learning_rate=args.learning_rate,
+        subsample=args.subsample,
+        lr_C=args.lr_C,
+        lr_max_iter=args.lr_max_iter,
+        lr_bin_size=args.lr_bin_size,
     )
 
     val_metrics = predictor.evaluate('val', max_tiles=args.max_tiles)
@@ -848,6 +967,7 @@ def main():
         'val': val_metrics,
         'test': test_metrics,
         'embedding_format': args.embedding_format,
+        'model': args.model,
     }
 
     predictor.plot_feature_importance(top_n=30)
@@ -858,7 +978,7 @@ def main():
     predictor.save_stratified_sample_info()
 
     print("\n" + "=" * 50)
-    print("Complete!")
+    print(f"Complete!  model={args.model.upper()}  format={args.embedding_format}")
     print(f"  Train R²: {train_metrics['train']['r2']:.3f}")
     if val_metrics:
         print(f"  Val   R²: {val_metrics['r2']:.3f}")
