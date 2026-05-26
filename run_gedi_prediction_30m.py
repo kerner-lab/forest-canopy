@@ -51,7 +51,7 @@ class GEDIPredictor30m:
                  embedding_format='float32', preprocessed_dir=None,
                  subset_fraction=None, subset_seed=42, subset_splits=None,
                  stratified_sample_fraction=None, stratified_sample_seed=42,
-                 stratified_splits=None, model_type='rf'):
+                 stratified_splits=None, model_type='rf', embedding_source='olmo'):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -72,8 +72,15 @@ class GEDIPredictor30m:
             stratified_sample_seed: Random seed for stratified pixel sampling (default: 42).
             stratified_splits: List of split names to apply stratified sampling to (default: ['train']).
             model_type: One of 'rf', 'xgb', 'gb', 'lr' (default: 'rf').
+            embedding_source: One of 'olmo', 'aef' (default: 'olmo'). Used for
+                              output naming and metadata; does not change how .npz
+                              files are loaded — point --preprocessed-dir at the
+                              correct source directory.
         """
         _VALID_MODELS = ('rf', 'xgb', 'gb', 'lr')
+        _VALID_SOURCES = ('olmo', 'aef')
+        if embedding_source not in _VALID_SOURCES:
+            raise ValueError(f"embedding_source must be one of {_VALID_SOURCES}")
         if model_type not in _VALID_MODELS:
             raise ValueError(f"model_type must be one of {_VALID_MODELS}")
         if model_type == 'xgb' and not _HAS_XGB:
@@ -110,7 +117,7 @@ class GEDIPredictor30m:
         self.logger.info(f"Split distribution:\n{self.gdf['split'].value_counts().to_string()}")
         print(f"Loaded {len(self.gdf)} tiles")
         print(f"Split distribution:\n{self.gdf['split'].value_counts()}")
-        print(f"Embedding format: {embedding_format}")
+        print(f"Embedding source: {embedding_source}  format: {embedding_format}")
         if self.preprocessed_dir:
             print(f"Using preprocessed cache: {self.preprocessed_dir}")
         if self.subset_fraction is not None:
@@ -120,6 +127,7 @@ class GEDIPredictor30m:
                   f"(seed={self.stratified_sample_seed}, splits={sorted(self.stratified_splits)})")
 
         self.model_type = model_type
+        self.embedding_source = embedding_source
         self.model = None
         self.feature_names = None
         self._subset_tile_ids = {}       # populated on first use per split
@@ -572,7 +580,7 @@ class GEDIPredictor30m:
         else:
             importances = self.model.feature_importances_
             ylabel = 'Importance'
-            title = f'Top {top_n} Feature Importances ({self.model_type.upper()}, {self.embedding_format})'
+            title = f'Top {top_n} Feature Importances ({self.model_type.upper()}, {self.embedding_source}, {self.embedding_format})'
         indices = np.argsort(importances)[::-1][:top_n]
         plt.figure(figsize=(10, 6))
         plt.bar(range(top_n), importances[indices])
@@ -590,12 +598,13 @@ class GEDIPredictor30m:
         if self.model is None:
             raise ValueError("Model not trained yet")
         if filename is None:
-            filename = f'gedi_{self.model_type}_30m_{self.embedding_format}.pkl'
+            filename = f'gedi_{self.model_type}_30m_{self.embedding_source}_{self.embedding_format}.pkl'
         model_path = self.output_dir / filename
         payload = {
             'model': self.model,
             'feature_names': self.feature_names,
             'embedding_format': self.embedding_format,
+            'embedding_source': self.embedding_source,
             'model_type': self.model_type,
         }
         if self.model_type == 'lr':
@@ -870,6 +879,11 @@ def main():
                         help='Output directory for models and results')
     parser.add_argument('--embedding-format', choices=['float32', 'int8'], default='float32',
                         help='Embedding format to load (default: float32)')
+    parser.add_argument('--embedding-source', choices=['olmo', 'aef'], default='olmo',
+                        help='Embedding source: olmo or aef (default: olmo). '
+                             'Used for output naming and metadata. When --year is provided '
+                             'and --preprocessed-dir is omitted, auto-constructs path as '
+                             '{embeddings-dir}/{year}/{embedding-source}/.')
     parser.add_argument('--model', choices=['rf', 'xgb', 'gb', 'lr'], default='rf',
                         help='Model architecture: rf=RandomForest, xgb=XGBoost, '
                              'gb=GradientBoosting, lr=LogisticRegression (binned) (default: rf)')
@@ -925,10 +939,9 @@ def main():
 
     if args.preprocessed_dir is None and args.year is not None:
         args.preprocessed_dir = str(
-            Path(args.embeddings_dir) / str(args.year)
-            / f"gedi_cache_30m_{args.embedding_format}"
+            Path(args.embeddings_dir) / str(args.year) / args.embedding_source
         )
-        print(f"Auto-constructed preprocessed-dir for year {args.year}: {args.preprocessed_dir}")
+        print(f"Auto-constructed preprocessed-dir: {args.preprocessed_dir}")
 
     predictor = GEDIPredictor30m(
         shapefile_path=args.shapefile,
@@ -944,6 +957,7 @@ def main():
         stratified_sample_seed=args.stratified_sample_seed,
         stratified_splits=args.stratified_splits,
         model_type=args.model,
+        embedding_source=args.embedding_source,
     )
 
     train_metrics = predictor.train(
@@ -967,6 +981,7 @@ def main():
         'val': val_metrics,
         'test': test_metrics,
         'embedding_format': args.embedding_format,
+        'embedding_source': args.embedding_source,
         'model': args.model,
         'year': args.year,
     }
@@ -979,7 +994,7 @@ def main():
     predictor.save_stratified_sample_info()
 
     print("\n" + "=" * 50)
-    print(f"Complete!  model={args.model.upper()}  format={args.embedding_format}  year={args.year}")
+    print(f"Complete!  model={args.model.upper()}  source={args.embedding_source}  format={args.embedding_format}  year={args.year}")
     print(f"  Train R²: {train_metrics['train']['r2']:.3f}")
     if val_metrics:
         print(f"  Val   R²: {val_metrics['r2']:.3f}")
