@@ -268,6 +268,7 @@ def run_qa(
     y: np.ndarray,            # (N,) GEDI heights in metres
     qa_dir: Path,
     logger: logging.Logger,
+    keep_zeros: bool = False,
 ) -> dict:
     """
     Run alignment and coverage checks on one processed tile.
@@ -298,7 +299,7 @@ def run_qa(
 
     valid_mask = (
         (gedi_data != gedi_nodata) &
-        (gedi_data > 0) &
+        (gedi_data >= 0 if keep_zeros else gedi_data > 0) &
         (gedi_data < GEDI_MAX_HEIGHT_CM)
     )
     n_valid = int(valid_mask.sum())
@@ -411,6 +412,7 @@ def process_tile(
     do_qa: bool = False,
     qa_dir: Path = None,
     test_fraction: float = None,
+    keep_zeros: bool = False,
 ) -> dict:
     """Process one tile end-to-end; return a status dict.
 
@@ -420,7 +422,7 @@ def process_tile(
     NOT suitable for training — use it only to verify alignment and QA plots quickly.
     """
     is_test = test_fraction is not None
-    suffix = "_test" if is_test else ""
+    suffix = ("_withzeros" if keep_zeros else "") + ("_test" if is_test else "")
     out_path = output_dir / f"healpix_{healpix_id}_float32{suffix}.npz"
     if not overwrite and out_path.exists():
         logger.info(f"Tile {healpix_id}: cached, skipping")
@@ -511,15 +513,16 @@ def process_tile(
             f"in {time.time() - t_reproj:.1f}s"
         )
 
-        # 8. Extract valid non-zero GEDI pixels
+        # 8. Extract valid GEDI pixels. With keep_zeros, 0-height measurements are
+        #    retained (gedi_data >= 0); otherwise only strictly-positive heights.
         valid_mask = (
             (gedi_data != gedi_nodata) &
-            (gedi_data > 0) &
+            (gedi_data >= 0 if keep_zeros else gedi_data > 0) &
             (gedi_data < GEDI_MAX_HEIGHT_CM)
         )
         rows, cols = np.where(valid_mask)
         if len(rows) == 0:
-            logger.info(f"Tile {healpix_id}: no valid non-zero GEDI pixels")
+            logger.info(f"Tile {healpix_id}: no valid GEDI pixels")
             return {"status": "no_valid_pixels", "healpix_id": int(healpix_id)}
 
         y = (gedi_data[rows, cols] / 100.0).astype(np.float32)  # cm → m
@@ -538,6 +541,7 @@ def process_tile(
                 y=y,
                 qa_dir=qa_dir,
                 logger=logger,
+                keep_zeros=keep_zeros,
             )
 
         # 10. Save
@@ -628,6 +632,15 @@ def main():
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-process tiles that already have a cached .npz")
     parser.add_argument(
+        "--keep-zeros", action="store_true",
+        help=(
+            "Keep GEDI height == 0 measurements in the output (gedi_data >= 0) "
+            "instead of discarding them (gedi_data > 0). Output saved as "
+            "healpix_*_float32_withzeros.npz so it does not collide with the "
+            "default zero-filtered cache. Filter zeros out downstream as needed."
+        ),
+    )
+    parser.add_argument(
         "--buffer", type=float, default=0.01,
         help="Degrees to pad around tile bounds before spatial subsetting",
     )
@@ -677,7 +690,8 @@ def main():
         print(f"Batch mode: {len(tile_ids)} tiles  splits={args.splits}  year={args.year}")
 
     if args.check_only:
-        cached = [t for t in tile_ids if (output_dir / f"healpix_{t}_float32.npz").exists()]
+        cache_suffix = "_withzeros" if args.keep_zeros else ""
+        cached = [t for t in tile_ids if (output_dir / f"healpix_{t}_float32{cache_suffix}.npz").exists()]
         missing = [t for t in tile_ids if t not in set(cached)]
         print(f"Cached : {len(cached)}/{len(tile_ids)}")
         if missing:
@@ -719,6 +733,7 @@ def main():
             do_qa=args.qa,
             qa_dir=qa_dir,
             test_fraction=args.test_fraction,
+            keep_zeros=args.keep_zeros,
         )
         results.append(result)
 

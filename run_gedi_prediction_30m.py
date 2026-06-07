@@ -51,7 +51,8 @@ class GEDIPredictor30m:
                  embedding_format='float32', preprocessed_dir=None,
                  subset_fraction=None, subset_seed=42, subset_splits=None,
                  stratified_sample_fraction=None, stratified_sample_seed=42,
-                 stratified_splits=None, model_type='rf', embedding_source='olmo'):
+                 stratified_splits=None, model_type='rf', embedding_source='olmo',
+                 include_zeros=False):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -76,6 +77,12 @@ class GEDIPredictor30m:
                               output naming and metadata; does not change how .npz
                               files are loaded — point --preprocessed-dir at the
                               correct source directory.
+            include_zeros: If True, keep GEDI height == 0 measurements (gedi_data >= 0)
+                           and, for the preprocessed path, load the
+                           healpix_*_{format}_withzeros.npz cache files written by
+                           alphaearth_processing.py --keep-zeros. If False (default),
+                           only strictly-positive heights are used and the default
+                           zero-filtered .npz cache is loaded.
         """
         _VALID_MODELS = ('rf', 'xgb', 'gb', 'lr')
         _VALID_SOURCES = ('olmo', 'aef')
@@ -97,6 +104,7 @@ class GEDIPredictor30m:
         self.embeddings_dir = Path(embeddings_dir)
         self.output_dir = Path(output_dir)
         self.embedding_format = embedding_format
+        self.include_zeros = include_zeros
         self.preprocessed_dir = Path(preprocessed_dir) if preprocessed_dir else None
         self.subset_fraction = subset_fraction
         self.subset_seed = subset_seed
@@ -156,6 +164,13 @@ class GEDIPredictor30m:
 
     def _embedding_path(self, healpix_id):
         return self.embeddings_dir / f"healpix_{healpix_id}_embeddings_{self.embedding_format}_reproj.zarr"
+
+    def _cache_path(self, healpix_id):
+        """Preprocessed .npz cache path for a tile. Adds the _withzeros suffix when
+        include_zeros is set so the zero-retaining caches are loaded instead of the
+        default zero-filtered ones."""
+        suffix = "_withzeros" if self.include_zeros else ""
+        return self.preprocessed_dir / f"healpix_{healpix_id}_{self.embedding_format}{suffix}.npz"
 
     def load_embeddings_tile(self, healpix_id):
         """
@@ -234,11 +249,12 @@ class GEDIPredictor30m:
             emb_h, emb_w, n_channels = embeddings.shape
             gedi_h, gedi_w = gedi_data.shape
 
-            # Valid GEDI mask: exclude nodata and keep non-zero heights
+            # Valid GEDI mask: exclude nodata. Keep zero heights when include_zeros
+            # is set (gedi_data >= 0), otherwise non-zero heights only (gedi_data > 0).
             nodata = src.nodata if src.nodata is not None else -9999
             valid_mask = (
                 (gedi_data != nodata) &
-                (gedi_data > 0) &       # non-zero forest height only
+                (gedi_data >= 0 if self.include_zeros else gedi_data > 0) &
                 (gedi_data < 12000)     # exclude outliers (stored in cm)
             )
 
@@ -343,10 +359,7 @@ class GEDIPredictor30m:
 
             skip_reason = None
             if self.preprocessed_dir is not None:
-                cache_path = (
-                    self.preprocessed_dir
-                    / f"healpix_{healpix_id}_{self.embedding_format}.npz"
-                )
+                cache_path = self._cache_path(healpix_id)
                 if cache_path.exists():
                     npz = np.load(cache_path)
                     X_tile, y_tile = npz['X'], npz['y']
@@ -589,7 +602,8 @@ class GEDIPredictor30m:
         plt.title(title)
         plt.xticks(range(top_n), indices, rotation=45)
         plt.tight_layout()
-        out = self.output_dir / 'feature_importance.png'
+        zeros_tag = '_withzeros' if self.include_zeros else ''
+        out = self.output_dir / f'feature_importance{zeros_tag}.png'
         plt.savefig(out, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Saved feature importance plot: {out}")
@@ -598,7 +612,8 @@ class GEDIPredictor30m:
         if self.model is None:
             raise ValueError("Model not trained yet")
         if filename is None:
-            filename = f'gedi_{self.model_type}_30m_{self.embedding_source}_{self.embedding_format}.pkl'
+            zeros_tag = '_withzeros' if self.include_zeros else ''
+            filename = f'gedi_{self.model_type}_30m_{self.embedding_source}_{self.embedding_format}{zeros_tag}.pkl'
         model_path = self.output_dir / filename
         payload = {
             'model': self.model,
@@ -606,6 +621,7 @@ class GEDIPredictor30m:
             'embedding_format': self.embedding_format,
             'embedding_source': self.embedding_source,
             'model_type': self.model_type,
+            'include_zeros': self.include_zeros,
         }
         if self.model_type == 'lr':
             payload['lr_bin_edges'] = self._lr_bin_edges
@@ -653,10 +669,7 @@ class GEDIPredictor30m:
         y_parts = []
 
         for healpix_id in tqdm(tiles, desc=f"Pass 1 [{split_name}]"):
-            cache_path = (
-                self.preprocessed_dir
-                / f"healpix_{healpix_id}_{self.embedding_format}.npz"
-            )
+            cache_path = self._cache_path(healpix_id)
             if not cache_path.exists():
                 self.logger.warning(f"Cache missing for tile {healpix_id}: {cache_path}")
                 continue
@@ -744,10 +757,7 @@ class GEDIPredictor30m:
                 zip(unique_tiles, tile_starts, tile_ends),
                 total=len(unique_tiles),
                 desc=f"Pass 2 [{split_name}]"):
-            cache_path = (
-                self.preprocessed_dir
-                / f"healpix_{tile_id}_{self.embedding_format}.npz"
-            )
+            cache_path = self._cache_path(tile_id)
             npz = np.load(cache_path)
             X_tile = npz['X']
             if self.embedding_format == 'int8' and X_tile.dtype == np.int8:
@@ -835,7 +845,10 @@ class GEDIPredictor30m:
         print(f"Saved stratified sample info: {out}")
         self.logger.info(f"Saved stratified sample info: {out}")
 
-    def save_metrics(self, metrics, filename='metrics.json'):
+    def save_metrics(self, metrics, filename=None):
+        if filename is None:
+            zeros_tag = '_withzeros' if self.include_zeros else ''
+            filename = f'metrics{zeros_tag}.json'
         path = self.output_dir / filename
         with open(path, 'w') as f:
             json.dump(metrics, f, indent=2)
@@ -934,6 +947,12 @@ def main():
     parser.add_argument('--stratified-splits', nargs='+', default=['train'],
                         metavar='SPLIT',
                         help='Which splits to apply stratified sampling to (default: train)')
+    parser.add_argument('--include-zeros', action='store_true',
+                        help='Include GEDI height == 0 measurements in the analysis '
+                             '(gedi_data >= 0). For the preprocessed path this loads the '
+                             'healpix_*_{format}_withzeros.npz cache files written by '
+                             'alphaearth_processing.py --keep-zeros. Default excludes zeros '
+                             'and loads the standard zero-filtered cache.')
 
     args = parser.parse_args()
 
@@ -958,6 +977,7 @@ def main():
         stratified_splits=args.stratified_splits,
         model_type=args.model,
         embedding_source=args.embedding_source,
+        include_zeros=args.include_zeros,
     )
 
     train_metrics = predictor.train(
@@ -984,6 +1004,7 @@ def main():
         'embedding_source': args.embedding_source,
         'model': args.model,
         'year': args.year,
+        'include_zeros': args.include_zeros,
     }
 
     predictor.plot_feature_importance(top_n=30)
