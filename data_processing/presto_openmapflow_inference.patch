@@ -1,0 +1,51 @@
+diff --git a/presto/dataops/dataset.py b/presto/dataops/dataset.py
+index ac2f203..f7fbe6c 100644
+--- a/presto/dataops/dataset.py
++++ b/presto/dataops/dataset.py
+@@ -15,7 +15,10 @@ import webdataset as wds
+ import yaml
+ from google.cloud import storage
+ from hurry.filesize import size
+-from openmapflow.ee_boundingbox import EEBoundingBox
++try:
++    from openmapflow.ee_boundingbox import EEBoundingBox
++except ImportError:  # inference-only: EE bounding-box export unused, openmapflow optional
++    EEBoundingBox = None
+ from shapely import geometry
+ from tqdm import tqdm
+ 
+diff --git a/presto/dataops/pipelines/ee_pipeline.py b/presto/dataops/pipelines/ee_pipeline.py
+index ffb0441..6e15ad6 100644
+--- a/presto/dataops/pipelines/ee_pipeline.py
++++ b/presto/dataops/pipelines/ee_pipeline.py
+@@ -6,7 +6,11 @@ import ee
+ import numpy as np
+ import xarray as xr
+ from google.cloud import storage
+-from openmapflow.ee_exporter import ee_safe_str, get_ee_task_list
++
++try:
++    from openmapflow.ee_exporter import ee_safe_str, get_ee_task_list
++except ImportError:  # inference-only: EE export helpers unused, openmapflow optional
++    ee_safe_str = get_ee_task_list = None
+ 
+ # Changing these parameters will require re-running exports for all files
+ # with a new prefix to differentiate them.
+diff --git a/presto/dataops/pipelines/s1_s2_era5_srtm.py b/presto/dataops/pipelines/s1_s2_era5_srtm.py
+index c68417e..ff6a8c1 100644
+--- a/presto/dataops/pipelines/s1_s2_era5_srtm.py
++++ b/presto/dataops/pipelines/s1_s2_era5_srtm.py
+@@ -8,8 +8,11 @@ from typing import Tuple
+ 
+ import ee
+ import numpy as np
+-from openmapflow.ee_exporter import create_ee_image
+-from openmapflow.engineer import calculate_ndvi, load_tif, remove_bands
++try:
++    from openmapflow.ee_exporter import create_ee_image
++    from openmapflow.engineer import calculate_ndvi, load_tif, remove_bands
++except ImportError:  # inference-only: EE export/engineer helpers unused, openmapflow optional
++    create_ee_image = calculate_ndvi = load_tif = remove_bands = None
+ 
+ from .ee_pipeline import EEPipeline, resample_and_flatten_tif
+ 
