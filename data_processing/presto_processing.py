@@ -142,6 +142,29 @@ def crop_bounds_centered(minx, miny, maxx, maxy, fraction: float) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Tile-level subsetting (mirror of run_gedi_prediction_30m.py)
+# ---------------------------------------------------------------------------
+
+def subset_tiles_for_split(tiles: np.ndarray, fraction: float, seed: int) -> np.ndarray:
+    """Deterministically pick `fraction` of a split's tiles.
+
+    This is a byte-for-byte mirror of the subsetting in
+    run_gedi_prediction_30m.py::prepare_split_data so the SAME tiles are selected
+    for a given (split, fraction, seed). Because np.random.default_rng(seed).choice
+    draws positional indices that depend only on len(tiles) and the seed, identical
+    selections require identical input arrays — i.e. the same shapefile, filtered
+    with gdf[gdf["split"] == split_name]["healpix_id"].values (same order). Do NOT
+    pre-sort or otherwise reorder `tiles` before calling this.
+
+    Returns the chosen healpix_ids sorted ascending (matching the predictor).
+    """
+    rng = np.random.default_rng(seed)
+    n_subset = max(1, int(round(len(tiles) * fraction)))
+    chosen = rng.choice(tiles, size=n_subset, replace=False)
+    return np.sort(chosen)
+
+
+# ---------------------------------------------------------------------------
 # rslearn: fetch a 12-month Sentinel-2 stack for a tile (free, no Earth Engine)
 # ---------------------------------------------------------------------------
 
@@ -227,15 +250,42 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
     return cfg_path
 
 
+# Set by main() from --verbose. When True, _run streams rslearn's stdout/stderr
+# live (so prepare/materialize progress shows in the job log) instead of capturing
+# it silently and only surfacing it on failure.
+_STREAM_RSLEARN = False
+
+
 def _run(cmd: list, logger: logging.Logger):
     logger.info("rslearn: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
+    if not _STREAM_RSLEARN:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
+                f"STDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}"
+            )
+        return proc.stdout
+
+    # Verbose: stream output line-by-line to our stdout (the job .out) and the log,
+    # while keeping a tail for the error message if the command fails.
+    print(f"  $ {' '.join(cmd)}", flush=True)
+    from collections import deque
+    tail = deque(maxlen=40)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        print(f"  [rslearn] {line}", flush=True)
+        logger.info("rslearn> %s", line)
+        tail.append(line)
+    rc = proc.wait()
+    if rc != 0:
         raise RuntimeError(
-            f"Command failed ({proc.returncode}): {' '.join(cmd)}\n"
-            f"STDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}"
+            f"Command failed ({rc}): {' '.join(cmd)}\n"
+            f"OUTPUT (tail):\n" + "\n".join(tail)
         )
-    return proc.stdout
+    return "\n".join(tail)
 
 
 def materialize_tile_rslearn(
@@ -742,7 +792,7 @@ def process_tile(
 # Logging
 # ---------------------------------------------------------------------------
 
-def setup_logging(output_dir: Path) -> logging.Logger:
+def setup_logging(output_dir: Path, console_level=logging.WARNING) -> logging.Logger:
     logger = logging.getLogger("presto")
     logger.setLevel(logging.INFO)
     if logger.handlers:
@@ -750,7 +800,7 @@ def setup_logging(output_dir: Path) -> logging.Logger:
     output_dir.mkdir(parents=True, exist_ok=True)
     log_file = output_dir / f"presto_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     fh = logging.FileHandler(log_file); fh.setLevel(logging.INFO)
-    ch = logging.StreamHandler(); ch.setLevel(logging.WARNING)
+    ch = logging.StreamHandler(); ch.setLevel(console_level)
     fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     fh.setFormatter(fmt); ch.setFormatter(fmt)
     logger.addHandler(fh); logger.addHandler(ch)
@@ -803,6 +853,20 @@ def main():
                              "fraction of its bbox before fetching imagery (e.g. 0.1 "
                              "= central 10%% per axis, ~1%% of area). Shrinks the rslearn "
                              "download and the number of Presto passes.")
+    parser.add_argument("--subset-tile-fraction", type=float, default=None,
+                        help="Embed only this fraction (0, 1] of a split's TILES, picking "
+                             "the SAME tiles as run_gedi_prediction_30m.py --subset-fraction "
+                             "(same seed/shapefile -> identical selection). Use to embed just "
+                             "10%% of train tiles for fast experiments. Distinct from "
+                             "--subset-fraction (a spatial bbox crop within a tile). Selected "
+                             "tile IDs are written to subset_tiles.json.")
+    parser.add_argument("--subset-tile-seed", type=int, default=42,
+                        help="Seed for --subset-tile-fraction. Must match "
+                             "run_gedi_prediction_30m.py --subset-seed (default 42).")
+    parser.add_argument("--subset-tile-splits", nargs="+", default=["train"],
+                        metavar="SPLIT",
+                        help="Which splits --subset-tile-fraction applies to. Must match "
+                             "run_gedi_prediction_30m.py --subset-splits (default: train).")
     parser.add_argument("--check-only", action="store_true",
                         help="Report cache coverage and exit")
     parser.add_argument("--save-tif", action="store_true",
@@ -812,6 +876,10 @@ def main():
                         help="Save per-tile diagnostic plots and stats")
     parser.add_argument("--qa-dir", default=None,
                         help="Directory for QA outputs (default: {output-dir}/qa/)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Send INFO logs to the console and stream rslearn's "
+                             "prepare/materialize output live (so you can watch S2 "
+                             "download/retry progress in the job log).")
     args = parser.parse_args()
 
     if args.imagery_dir is None and args.rslearn_root is None:
@@ -820,7 +888,10 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logging(output_dir)
+    global _STREAM_RSLEARN
+    _STREAM_RSLEARN = args.verbose
+    logger = setup_logging(output_dir,
+                           console_level=logging.INFO if args.verbose else logging.WARNING)
     qa_dir = Path(args.qa_dir) if args.qa_dir else output_dir / "qa"
     if args.qa:
         qa_dir.mkdir(parents=True, exist_ok=True)
@@ -836,11 +907,42 @@ def main():
         tile_ids = [args.healpix_id]
         print(f"Single-tile mode: tile {args.healpix_id}  year={args.year}")
     else:
+        subset_tile_splits = set(args.subset_tile_splits)
+        do_subset = (args.subset_tile_fraction is not None
+                     and args.subset_tile_fraction < 1.0)
+        if do_subset and not (0 < args.subset_tile_fraction <= 1):
+            parser.error("--subset-tile-fraction must be in (0, 1]")
+
+        subset_selected = {}  # split -> chosen healpix_ids (for subset_tiles.json)
         if "split" in gdf.columns:
-            tile_ids = gdf[gdf["split"].isin(args.splits)]["healpix_id"].tolist()
+            # Build the tile list per split (not via isin) so subsetting reproduces
+            # run_gedi_prediction_30m.py's per-split selection exactly.
+            tile_ids = []
+            for split_name in args.splits:
+                split_tiles = gdf[gdf["split"] == split_name]["healpix_id"].values
+                if do_subset and split_name in subset_tile_splits:
+                    n_before = len(split_tiles)
+                    split_tiles = subset_tiles_for_split(
+                        split_tiles, args.subset_tile_fraction, args.subset_tile_seed)
+                    subset_selected[split_name] = [int(t) for t in split_tiles]
+                    print(f"  Subset '{split_name}': {len(split_tiles)}/{n_before} tiles "
+                          f"(fraction={args.subset_tile_fraction}, seed={args.subset_tile_seed})")
+                tile_ids.extend(int(t) for t in split_tiles)
         else:
             tile_ids = gdf["healpix_id"].tolist()
+            if do_subset:
+                print("Warning: --subset-tile-fraction ignored (shapefile has no 'split' column)")
         print(f"Batch mode: {len(tile_ids)} tiles  splits={args.splits}  year={args.year}")
+
+        if subset_selected:
+            subset_path = output_dir / "subset_tiles.json"
+            with open(subset_path, "w") as f:
+                json.dump({
+                    "subset_fraction": args.subset_tile_fraction,
+                    "subset_seed": args.subset_tile_seed,
+                    "splits": subset_selected,
+                }, f, indent=2)
+            print(f"Saved subset tile IDs: {subset_path}")
 
     if args.check_only:
         cache_suffix = "_withzeros" if args.keep_zeros else ""
