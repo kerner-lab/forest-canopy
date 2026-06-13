@@ -177,6 +177,14 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
     PRESTO_NUM_TIMESTEPS 30-day sub-periods via period_duration="30d" + max_matches=12,
     yielding 12 monthly composites materialized as sentinel2, sentinel2.1, ... sentinel2.11.
 
+    NOTE on space_mode: use "PER_PERIOD_MOSAIC", NOT "MOSAIC". PER_PERIOD_MOSAIC builds one
+    independent mosaic *per* 30-day period (giving the 12 separate monthly layer groups this
+    pipeline expects). Plain "MOSAIC" produced no imagery on cloudy / sparse-revisit tiles —
+    it was why ~1/3 of tiles failed with "no S2 monthly imagery found" while the OLMo rslearn
+    dataset (which uses PER_PERIOD_MOSAIC + sort_by=eo:cloud_cover) pulled S2 over the exact
+    same regions. We also set init_args.sort_by="eo:cloud_cover" so each period prefers its
+    least-cloudy scene, matching the OLMo config that works on every tile.
+
     NOTE on durations: rslearn parses these strings with pytimeparse, which reads "M" as
     MINUTES, not months ("1M" -> 60s, "12M" -> 12min). Use day units ("30d"). Also do NOT
     set the data_source "duration" key — it would override the request end to start+duration
@@ -191,21 +199,27 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
         queried via BigQuery, which requires a GCP project with billing enabled.
     """
     query_config = {
-        "space_mode": "MOSAIC",
+        # PER_PERIOD_MOSAIC = one mosaic per 30-day period -> 12 monthly layer groups.
+        # This matches the OLMo dataset config and fixes the "no S2 monthly imagery"
+        # failures that plain "MOSAIC" caused on cloudy / sparse tiles.
+        "space_mode": "PER_PERIOD_MOSAIC",
         "max_matches": PRESTO_NUM_TIMESTEPS,
         "period_duration": "30d",  # ~1 month; pytimeparse has no month unit
     }
     if source == "pc":
         data_source = {
             "class_path": "rslearn.data_sources.planetary_computer.Sentinel2",
-            "init_args": {"harmonize": True},
+            # sort_by=eo:cloud_cover -> each period picks its least-cloudy scene
+            # (matches the OLMo config that pulls S2 over every tile).
+            "init_args": {"harmonize": True, "sort_by": "eo:cloud_cover"},
             "query_config": query_config,
             "ingest": False,  # COGs are read directly during materialize
         }
     elif source == "element84":
         data_source = {
             "class_path": "rslearn.data_sources.aws_sentinel2_element84.Sentinel2",
-            "init_args": {"cache_dir": str(root / "cache" / "s2_stac")},
+            "init_args": {"cache_dir": str(root / "cache" / "s2_stac"),
+                          "sort_by": "eo:cloud_cover"},
             "query_config": query_config,
             "ingest": False,
         }
