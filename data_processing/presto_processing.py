@@ -207,6 +207,12 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
         "space_mode": "MOSAIC",
         "max_matches": PRESTO_NUM_TIMESTEPS,
         "period_duration": "30d",  # ~1 month; pytimeparse has no month unit
+        # Return the 12 monthly groups oldest-first (chronological). rslearn still
+        # defaults this to True (most-recent-first); without it, find_monthly_geotiffs
+        # would build the stack reversed while embed_pixels labels timestep t as
+        # month0+t -> every embedding's months would be inverted (Jan imagery told to
+        # Presto as Dec, etc.). False fixes the order AND silences the deprecation warning.
+        "per_period_mosaic_reverse_time_order": False,
     }
     if source == "pc":
         data_source = {
