@@ -220,8 +220,12 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
     elif source == "element84":
         data_source = {
             "class_path": "rslearn.data_sources.aws_sentinel2_element84.Sentinel2",
-            "init_args": {"cache_dir": str(root / "cache" / "s2_stac"),
-                          "sort_by": "eo:cloud_cover"},
+            # No cache_dir: it's deprecated/unused in current rslearn (item data is
+            # passed straight to materialization) and warns/errors if set. COGs on
+            # s3://sentinel-cogs are read directly during materialize (ingest=False).
+            # Bands map via ASSET_BANDS (blue->B02 ... swir22->B12, nir08->B8A) and
+            # are already harmonized, so no harmonize arg is needed.
+            "init_args": {"sort_by": "eo:cloud_cover"},
             "query_config": query_config,
             "ingest": False,
         }
