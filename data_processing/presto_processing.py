@@ -177,13 +177,13 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
     PRESTO_NUM_TIMESTEPS 30-day sub-periods via period_duration="30d" + max_matches=12,
     yielding 12 monthly composites materialized as sentinel2, sentinel2.1, ... sentinel2.11.
 
-    NOTE on space_mode: use "PER_PERIOD_MOSAIC", NOT "MOSAIC". PER_PERIOD_MOSAIC builds one
-    independent mosaic *per* 30-day period (giving the 12 separate monthly layer groups this
-    pipeline expects). Plain "MOSAIC" produced no imagery on cloudy / sparse-revisit tiles —
-    it was why ~1/3 of tiles failed with "no S2 monthly imagery found" while the OLMo rslearn
-    dataset (which uses PER_PERIOD_MOSAIC + sort_by=eo:cloud_cover) pulled S2 over the exact
-    same regions. We also set init_args.sort_by="eo:cloud_cover" so each period prefers its
-    least-cloudy scene, matching the OLMo config that works on every tile.
+    NOTE on the "no S2 monthly imagery found" failures (~1/3 of tiles): the real fix was
+    init_args.sort_by="eo:cloud_cover" — without it, cloudy / sparse-revisit tiles matched no
+    usable scene and materialized nothing, while the OLMo rslearn dataset (which sets sort_by)
+    pulled S2 over the exact same regions. space_mode="MOSAIC" WITH period_duration builds one
+    mosaic per 30-day period (the 12 monthly layer groups this pipeline expects); it is the
+    modern equivalent of the deprecated PER_PERIOD_MOSAIC, so use MOSAIC to avoid the rslearn
+    deprecation warning.
 
     NOTE on durations: rslearn parses these strings with pytimeparse, which reads "M" as
     MINUTES, not months ("1M" -> 60s, "12M" -> 12min). Use day units ("30d"). Also do NOT
@@ -199,10 +199,12 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
         queried via BigQuery, which requires a GCP project with billing enabled.
     """
     query_config = {
-        # PER_PERIOD_MOSAIC = one mosaic per 30-day period -> 12 monthly layer groups.
-        # This matches the OLMo dataset config and fixes the "no S2 monthly imagery"
-        # failures that plain "MOSAIC" caused on cloudy / sparse tiles.
-        "space_mode": "PER_PERIOD_MOSAIC",
+        # MOSAIC + period_duration = one mosaic per 30-day period -> 12 monthly layer
+        # groups. (This is the modern equivalent of the now-deprecated PER_PERIOD_MOSAIC;
+        # rslearn warns "Use SpaceMode.MOSAIC with period_duration instead".) The real fix
+        # for the "no S2 monthly imagery" failures was sort_by=eo:cloud_cover in init_args,
+        # not the space_mode.
+        "space_mode": "MOSAIC",
         "max_matches": PRESTO_NUM_TIMESTEPS,
         "period_duration": "30d",  # ~1 month; pytimeparse has no month unit
     }
@@ -343,12 +345,23 @@ def materialize_tile_rslearn(
     ]
     _run(add_cmd, logger)
 
+    # Planetary Computer's STAC search and blob downloads return transient 5xx
+    # (e.g. "504 Gateway Timeout"), especially when several array jobs hit the
+    # endpoint at once. Retry with backoff. AND pass --no-ignore-errors so that a
+    # failure surviving the retries makes the step exit non-zero: otherwise
+    # rslearn's default --ignore-errors logs the 504, marks the window failed, and
+    # exits 0, so the run silently falls through to a false "no imagery" with a
+    # clean exit code (the tile then looks done and never gets resubmitted).
+    retry_args = ["--retry-max-attempts", "5", "--retry-backoff-seconds", "5",
+                  "--no-ignore-errors"]
+
     # PC and Element84 read COGs directly during materialize -> no ingest step.
     steps = ("prepare", "ingest", "materialize") if source == "gcp" \
         else ("prepare", "materialize")
     for step in steps:
         _run(["rslearn", "dataset", step, "--root", str(root),
-              "--group", RSLEARN_GROUP, "--workers", str(workers)], logger)
+              "--group", RSLEARN_GROUP, "--workers", str(workers),
+              *retry_args], logger)
 
     if not win_dir.exists():
         raise FileNotFoundError(f"rslearn window not found after materialize: {win_dir}")
