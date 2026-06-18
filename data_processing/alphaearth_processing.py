@@ -89,7 +89,13 @@ def open_aef_mosaic() -> xr.Dataset:
         storage_options={"anon": True},
         read_only=True,
     )
-    ds = xr.open_zarr(store, zarr_format=3, consolidated=False)
+    # chunks=None -> NO dask. With dask (the default chunks={}), building/optimizing the
+    # task graph for this many-chunk zarr-v3 store hangs indefinitely at zero network
+    # (dask.highlevelgraph cull / get_output_keys) on the current zarr 3.1.x + dask 2026.x
+    # stack. chunks=None routes reads straight through zarr (which fetches chunks
+    # concurrently itself), so .compute()/.values just works. subset_aef + dequantize
+    # downstream are unchanged — .compute() on a non-dask DataArray simply loads it.
+    ds = xr.open_zarr(store, zarr_format=3, consolidated=False, chunks=None)
     print(f"Opened aef-mosaic in {time.time() - tic:.2f}s")
     return ds
 

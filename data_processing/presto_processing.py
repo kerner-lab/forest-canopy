@@ -107,6 +107,16 @@ S2_BANDSET_NAME = "_".join(RSLEARN_S2_BANDS)
 RSLEARN_LAYER = "sentinel2"
 RSLEARN_GROUP = "presto"
 
+# Sentinel-1 (optional, --with-s1): VV/VH from Planetary Computer, materialized as 12
+# monthly mosaics alongside S2 on the SAME window grid. Presto's built-in "S1" channel
+# group expects VV/VH in decibels; PC's Sentinel-1 RTC is linear gamma0, so we convert
+# (see s1_to_presto_db). Element84 has no S1, so S1 always comes from PC even when
+# --s2-source element84 (mixed per-layer sources are fine in one rslearn dataset).
+RSLEARN_S1_LAYER = "sentinel1"
+RSLEARN_S1_BANDS = ["vv", "vh"]
+S1_BANDSET_NAME = "_".join(RSLEARN_S1_BANDS)
+PRESTO_S1_BANDS = ["VV", "VH"]  # names construct_single_presto_input expects
+
 
 # ---------------------------------------------------------------------------
 # Tile bounds (shared with the TESSERA / Alpha Earth / Major TOM scripts)
@@ -168,7 +178,7 @@ def subset_tiles_for_split(tiles: np.ndarray, fraction: float, seed: int) -> np.
 # rslearn: fetch a 12-month Sentinel-2 stack for a tile (free, no Earth Engine)
 # ---------------------------------------------------------------------------
 
-def write_rslearn_config(root: Path, source: str = "pc") -> Path:
+def write_rslearn_config(root: Path, source: str = "pc", with_s1: bool = False) -> Path:
     """
     Write a minimal rslearn dataset config.json that pulls a 12-month Sentinel-2
     mosaic for each tile.
@@ -246,22 +256,49 @@ def write_rslearn_config(root: Path, source: str = "pc") -> Path:
     else:
         raise ValueError(f"Unknown --s2-source {source!r} (expected pc, element84, or gcp)")
 
-    config = {
-        "layers": {
-            RSLEARN_LAYER: {
-                "type": "raster",
-                "band_sets": [
-                    {
-                        "dtype": "uint16",
-                        "bands": RSLEARN_S2_BANDS,
-                    }
-                ],
-                "data_source": data_source,
-                "resampling_method": "bilinear",
-                "compositing_method": "FIRST_VALID",
-            }
+    layers = {
+        RSLEARN_LAYER: {
+            "type": "raster",
+            "band_sets": [
+                {
+                    "dtype": "uint16",
+                    "bands": RSLEARN_S2_BANDS,
+                }
+            ],
+            "data_source": data_source,
+            "resampling_method": "bilinear",
+            "compositing_method": "FIRST_VALID",
         }
     }
+    if with_s1:
+        # Sentinel-1 VV/VH from Planetary Computer (IW mode, dual-pol), 12 monthly
+        # mosaics on the same chronological schedule as S2 (same query_config, so the
+        # per_period_mosaic_reverse_time_order=False fix applies to S1 too). Mirrors the
+        # OLMo S1 layer. PC has no anonymous element84 S1, so this is always PC.
+        layers[RSLEARN_S1_LAYER] = {
+            "type": "raster",
+            "band_sets": [
+                {
+                    "dtype": "float32",
+                    "bands": RSLEARN_S1_BANDS,
+                    "nodata_vals": [-32768, -32768],
+                }
+            ],
+            "data_source": {
+                "class_path": "rslearn.data_sources.planetary_computer.Sentinel1",
+                "init_args": {
+                    "query": {
+                        "sar:instrument_mode": {"eq": "IW"},
+                        "sar:polarizations": {"eq": ["VV", "VH"]},
+                    }
+                },
+                "query_config": query_config,
+                "ingest": False,
+            },
+            "resampling_method": "bilinear",
+            "compositing_method": "FIRST_VALID",
+        }
+    config = {"layers": layers}
     root.mkdir(parents=True, exist_ok=True)
     cfg_path = root / "config.json"
     new_text = json.dumps(config, indent=2)
@@ -323,15 +360,17 @@ def materialize_tile_rslearn(
     logger: logging.Logger,
     workers: int = 4,
     source: str = "pc",
+    with_s1: bool = False,
 ) -> Path:
     """
-    Add a window for the tile, then prepare/(ingest)/materialize a 12-month S2 stack.
+    Add a window for the tile, then prepare/(ingest)/materialize a 12-month S2 stack
+    (and, with with_s1, a 12-month S1 stack on the same grid).
 
     Returns the window directory: root/windows/<group>/healpix_<id>/
     """
     # Always refresh the config (it only rewrites when content changed) so a stale
-    # config from a previous --s2-source or an old period_duration is never reused.
-    write_rslearn_config(root, source=source)
+    # config from a previous --s2-source / --with-s1 / period_duration is never reused.
+    write_rslearn_config(root, source=source, with_s1=with_s1)
 
     win_name = f"healpix_{healpix_id}"
     win_dir = root / "windows" / RSLEARN_GROUP / win_name
@@ -391,6 +430,40 @@ def find_monthly_geotiffs(win_dir: Path) -> list:
         if p.exists():
             paths.append(p)
     return paths
+
+
+def find_s1_monthly_geotiffs(win_dir: Path) -> list:
+    """The (up to 12) monthly Sentinel-1 VV/VH geotiffs for a window, temporal order."""
+    paths = []
+    for i in range(PRESTO_NUM_TIMESTEPS):
+        layer = RSLEARN_S1_LAYER if i == 0 else f"{RSLEARN_S1_LAYER}.{i}"
+        p = win_dir / "layers" / layer / S1_BANDSET_NAME / "geotiff.tif"
+        if p.exists():
+            paths.append(p)
+    return paths
+
+
+def s1_to_presto_db(s1_stack: np.ndarray, units: str = "linear") -> np.ndarray:
+    """Prepare a raw S1 stack (T, 2, H, W) for Presto's dB-scale S1 channel group.
+
+    PC Sentinel-1 RTC is linear gamma0 (units="linear") -> convert to dB via 10*log10.
+    If your source already provides dB, pass units="db" (pass-through). Nodata (the
+    -32768 fill, and non-positive values that can't be log'd) are replaced with the
+    per-band mean so they normalize to ~0 (neutral) inside Presto rather than corrupting
+    the embedding. NOTE: verify your S1 units by value range — linear gamma0 ~ 0..1,
+    dB ~ -30..+5.
+    """
+    s1 = s1_stack.astype(np.float32)
+    s1 = np.where(s1 <= -1000.0, np.nan, s1)  # nodata fill
+    if units == "linear":
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s1 = np.where(s1 > 0, 10.0 * np.log10(s1), np.nan)
+    for b in range(s1.shape[1]):
+        band = s1[:, b]
+        m = np.nanmean(band)
+        band[~np.isfinite(band)] = m if np.isfinite(m) else 0.0
+        s1[:, b] = band
+    return s1
 
 
 def find_imagery_dir_geotiffs(imagery_dir: Path, healpix_id: int) -> list:
@@ -461,8 +534,14 @@ def embed_pixels(
     device: str,
     batch_size: int,
     logger: logging.Logger,
+    s1_stack: np.ndarray = None,   # (T, 2, H, W) dB-scale VV/VH, or None for S2-only
+    s1_band_names: list = None,    # e.g. PRESTO_S1_BANDS (["VV","VH"])
 ) -> np.ndarray:
-    """Run Presto over N pixels -> (N, 128) float32 embeddings."""
+    """Run Presto over N pixels -> (N, 128) float32 embeddings.
+
+    If s1_stack is given, each pixel's VV/VH time series is fed alongside S2 so Presto's
+    S1 channel group is active; otherwise S1 is masked (S2-only) exactly as before.
+    """
     import torch
     from presto import construct_single_presto_input
 
@@ -472,6 +551,9 @@ def embed_pixels(
 
     # Per-pixel time series: (N, T, n_bands)
     ts = np.transpose(s2_stack[:, :, rows, cols], (2, 0, 1)).astype(np.float32)
+    ts_s1 = None
+    if s1_stack is not None:
+        ts_s1 = np.transpose(s1_stack[:, :, rows, cols], (2, 0, 1)).astype(np.float32)  # (N,T,2)
 
     iterator = range(0, N, batch_size)
     if _HAS_TQDM:
@@ -481,11 +563,15 @@ def embed_pixels(
         sl = slice(start, min(start + batch_size, N))
         xs, masks, dws = [], [], []
         for k in range(sl.start, sl.stop):
-            x, mask, dw = construct_single_presto_input(
+            kwargs = dict(
                 s2=torch.from_numpy(ts[k]),       # (T, n_bands)
                 s2_bands=s2_band_names,
                 normalize=True,
             )
+            if ts_s1 is not None:
+                kwargs["s1"] = torch.from_numpy(ts_s1[k])   # (T, 2)
+                kwargs["s1_bands"] = s1_band_names
+            x, mask, dw = construct_single_presto_input(**kwargs)
             xs.append(x)
             masks.append(mask)
             dws.append(dw)
@@ -683,7 +769,7 @@ def process_tile(
     healpix_id, year, start_month, gdf, gedi_dir, output_dir, overwrite,
     encoder, device, batch_size, rslearn_root, imagery_dir, rslearn_workers,
     logger, do_qa=False, qa_dir=None, keep_zeros=False, subset_fraction=None,
-    s2_source="pc", save_tif=False,
+    s2_source="pc", save_tif=False, with_s1=False, s1_units="linear",
 ) -> dict:
     suffix = "_withzeros" if keep_zeros else ""
     out_path = output_dir / f"healpix_{healpix_id}_float32{suffix}.npz"
@@ -730,7 +816,7 @@ def process_tile(
             win_dir = materialize_tile_rslearn(
                 healpix_id, lon_min, lat_min, lon_max, lat_max, year,
                 start_month, Path(rslearn_root), logger, workers=rslearn_workers,
-                source=s2_source)
+                source=s2_source, with_s1=with_s1)
             paths = find_monthly_geotiffs(win_dir)
         if len(paths) == 0:
             logger.warning(f"Tile {healpix_id}: no S2 monthly imagery found")
@@ -741,6 +827,24 @@ def process_tile(
 
         s2_stack, s2_transform, s2_crs, s2_h, s2_w = load_s2_stack(paths)
         print(f"  Tile {healpix_id}: S2 stack {s2_stack.shape} ({len(paths)} months)")
+
+        # Optional Sentinel-1: only use it when it has the SAME number of monthly layers
+        # as S2 (so the per-timestep months line up); otherwise fall back to S2-only so
+        # the time series can never silently misalign. S1 shares the S2 window grid, so
+        # the same s2_rows/s2_cols index it. (Not available via --imagery-dir.)
+        s1_stack = None
+        if with_s1 and imagery_dir is None:
+            s1_paths = find_s1_monthly_geotiffs(win_dir)
+            if len(s1_paths) == s2_stack.shape[0] and len(s1_paths) > 0:
+                s1_raw, _, _, _, _ = load_s2_stack(s1_paths)  # (T, 2, H, W) raw
+                s1_stack = s1_to_presto_db(s1_raw, units=s1_units)
+                print(f"  Tile {healpix_id}: S1 stack {s1_stack.shape} (dB)")
+            elif len(s1_paths) > 0:
+                logger.warning("Tile %s: S1 months (%d) != S2 months (%d); using S2-only",
+                               healpix_id, len(s1_paths), s2_stack.shape[0])
+            else:
+                logger.warning("Tile %s: --with-s1 set but no S1 imagery; using S2-only",
+                               healpix_id)
 
         # 3. GEDI target + valid pixels.
         gedi_data, gedi_nodata, gedi_transform, gedi_crs, gedi_h, gedi_w = \
@@ -775,7 +879,8 @@ def process_tile(
         X = embed_pixels(
             s2_stack, PRESTO_S2_BANDS,
             s2_rows[keep_idx], s2_cols[keep_idx], latlons[keep_idx],
-            start_month, encoder, device, batch_size, logger)
+            start_month, encoder, device, batch_size, logger,
+            s1_stack=s1_stack, s1_band_names=PRESTO_S1_BANDS)
         logger.info("Tile %s: Presto embedded %d px in %.1fs",
                     healpix_id, len(keep_idx), time.time() - t_emb)
 
@@ -877,6 +982,14 @@ def main():
                              "(free, no billing). 'element84' = free AWS L2A COGs (no account/"
                              "billing). 'gcp' = gcp_public_data L1C (free imagery but the "
                              "scene index uses BigQuery, which needs a billing-enabled project).")
+    parser.add_argument("--with-s1", action=argparse.BooleanOptionalAction, default=False,
+                        help="Also feed Sentinel-1 (VV/VH from Planetary Computer) to "
+                             "Presto, materialized as 12 monthly mosaics alongside S2. "
+                             "Activates Presto's S1 channel group (S2-only when omitted).")
+    parser.add_argument("--s1-units", choices=["linear", "db"], default="linear",
+                        help="Units of the materialized S1. PC Sentinel-1 RTC is linear "
+                             "gamma0 ('linear', converted to dB for Presto); use 'db' if "
+                             "your source already provides decibels.")
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"],
                         help="Splits to include in batch mode")
     parser.add_argument("--batch-size", type=int, default=2048,
@@ -1007,7 +1120,7 @@ def main():
             rslearn_workers=args.rslearn_workers, logger=logger,
             do_qa=args.qa, qa_dir=qa_dir, keep_zeros=args.keep_zeros,
             subset_fraction=args.subset_fraction, s2_source=args.s2_source,
-            save_tif=args.save_tif,
+            save_tif=args.save_tif, with_s1=args.with_s1, s1_units=args.s1_units,
         ))
 
     counts: dict = {}
