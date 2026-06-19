@@ -131,12 +131,18 @@ def train_rf(X, y, args):
 # 2-3. Wall-to-wall prediction -> GeoTIFF
 # ---------------------------------------------------------------------------
 
-def predict_wall_to_wall(rf, aoi_tif, output_tif, n_features, block_rows):
+def predict_wall_to_wall(rf, aoi_tif, output_tif, n_features, block_rows,
+                         compress="lzw", predictor=0):
     """Predict over the AOI AEF GeoTIFF, writing a single-band float32 height raster.
 
     Reads in row strips to bound memory. Valid pixels = finite across all bands (the AOI
     tif uses NaN for outside-polygon / no-coverage). Output nodata = NaN, so a predicted
     height of 0 remains a valid value.
+
+    The output is one band (~tens of MB), so compression barely matters — default to LZW
+    (no predictor), which is stable everywhere. `deflate`+`predictor=3` (float predictor)
+    can abort with "double free / corruption" at GDAL close on some libtiff builds, so it
+    is NOT the default; pass --compress deflate --predictor 3 only if you know it's safe.
     """
     with rasterio.open(aoi_tif) as src:
         if src.count != n_features:
@@ -144,8 +150,16 @@ def predict_wall_to_wall(rf, aoi_tif, output_tif, n_features, block_rows):
                      f"{n_features} features — band/feature mismatch.")
         profile = src.profile.copy()
         profile.update(count=1, dtype="float32", nodata=np.float32("nan"),
-                       compress="deflate", predictor=3, tiled=True,
-                       blockxsize=512, blockysize=512, BIGTIFF="IF_SAFER")
+                       tiled=True, blockxsize=512, blockysize=512, BIGTIFF="IF_SAFER",
+                       num_threads=1)
+        # Don't inherit the source AOI tif's deflate+predictor=3 (the likely crash-at-close
+        # culprit). Reset and apply our own, stable choice.
+        profile.pop("compress", None)
+        profile.pop("predictor", None)
+        if compress and compress.lower() != "none":
+            profile["compress"] = compress
+            if predictor:
+                profile["predictor"] = predictor
         H, W = src.height, src.width
 
         n_valid = 0
@@ -235,6 +249,11 @@ def main():
     ap.add_argument("--random-state", type=int, default=42)
     # Prediction / plot
     ap.add_argument("--block-rows", type=int, default=256, help="rows per prediction strip")
+    ap.add_argument("--compress", default="lzw",
+                    help="output GeoTIFF compression: lzw (default, stable), deflate, zstd, none")
+    ap.add_argument("--predictor", type=int, default=0,
+                    help="TIFF predictor (0=none). 3=float predictor needs deflate/zstd and "
+                         "can crash at close on some libtiff builds — leave 0 unless sure.")
     ap.add_argument("--cmap", default="viridis", help="matplotlib colormap for the height map")
     ap.add_argument("--vmin", type=float, default=0.0, help="colorbar min (0 m is valid)")
     ap.add_argument("--vmax", type=float, default=None,
@@ -262,7 +281,8 @@ def main():
 
     # 2-3. Predict wall-to-wall -> GeoTIFF
     print(f"\nPredicting wall-to-wall over {args.aoi_tif} ...")
-    n_valid = predict_wall_to_wall(rf, args.aoi_tif, str(output_tif), n_features, args.block_rows)
+    n_valid = predict_wall_to_wall(rf, args.aoi_tif, str(output_tif), n_features,
+                                   args.block_rows, compress=args.compress, predictor=args.predictor)
 
     # 4. Map
     plot_prediction(str(output_tif), str(output_plot), args.cmap, args.vmin, args.vmax, args.title)
