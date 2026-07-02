@@ -209,14 +209,25 @@ def run_cmd(cmd: list, logger: logging.Logger, env: dict = None):
 # rslearn orchestration (mirrors your rslearn_olmo bash)
 # ---------------------------------------------------------------------------
 
-def write_dataset_config(dataset_path: Path, config_src: str = None) -> Path:
-    """Write the shared dataset config.json (your OLMo config, or a copy of config_src)."""
+def write_dataset_config(dataset_path: Path, config_src: str = None,
+                         prithvi_emb_dim: int = None) -> Path:
+    """Write the shared dataset config.json (your OLMo config, or a copy of config_src).
+
+    When using the built-in config, `prithvi_emb_dim` (if given) sets the
+    prithvi_embeddings output layer's num_bands. This MUST equal the channel count
+    rslearn's PrithviV2 actually writes; if `rslearn model predict` errors on a
+    band-count mismatch, rerun with --prithvi-emb-dim set to the value in the error
+    (no source edit needed).
+    """
     dataset_path.mkdir(parents=True, exist_ok=True)
     cfg_path = dataset_path / "config.json"
     if config_src:
         text = Path(config_src).read_text()
     else:
-        text = json.dumps(OLMO_DATASET_CONFIG, indent=2)
+        cfg = json.loads(json.dumps(OLMO_DATASET_CONFIG))   # deep copy
+        if prithvi_emb_dim is not None:
+            cfg["layers"]["prithvi_embeddings"]["band_sets"][0]["num_bands"] = int(prithvi_emb_dim)
+        text = json.dumps(cfg, indent=2)
     if cfg_path.exists() and cfg_path.read_text() == text:
         return cfg_path
     tmp = cfg_path.with_suffix(f".json.tmp.{os.getpid()}")
@@ -269,6 +280,9 @@ def prithvi_predict(dataset_path: Path, model_config: str, prefix: list, logger)
     """
     env = dict(os.environ)
     env["DATASET_PATH"] = str(dataset_path)
+    logger.info("Prithvi predict: if this fails with a band-count / num_bands mismatch, "
+                "note the expected value in the error and rerun with --prithvi-emb-dim <N> "
+                "(and --overwrite).")
     run_cmd(prefix + ["rslearn", "model", "predict", "--config", model_config], logger, env=env)
 
 
@@ -421,13 +435,34 @@ def save_dense_npz(out_path: Path, X_grid, y_grid, transform, crs):
     )
 
 
+def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid) -> int:
+    """Write the valid-GEDI-pixel (X, y) format consumed by
+    run_gedi_prediction_30m.py --preprocessed-dir --embedding-format float32.
+
+    X_grid: (C,H,W); y_grid: (H,W) with NaN where GEDI is invalid. Keeps only
+    pixels with finite GEDI AND a fully finite embedding vector (drops no-coverage
+    rows). File is named healpix_<id>_float32.npz so the per-model xy_dir can be
+    passed straight to --preprocessed-dir. Returns the number of samples kept.
+    """
+    X_hwc = X_grid.transpose(1, 2, 0)                 # (H, W, C)
+    mask = np.isfinite(y_grid)
+    Xv = X_hwc[mask]                                   # (N, C)
+    yv = y_grid[mask]                                  # (N,)
+    finite = np.all(np.isfinite(Xv), axis=1)
+    Xv, yv = Xv[finite], yv[finite]
+    xy_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(xy_dir / f"healpix_{healpix_id}_float32.npz",
+                        X=Xv.astype(np.float32), y=yv.astype(np.float32))
+    return int(len(yv))
+
+
 # ---------------------------------------------------------------------------
 # Per-tile export (after the shared materialize + OLMo predict)
 # ---------------------------------------------------------------------------
 
 def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sampling,
                 encoder, device, batch_size, block_rows, do_olmo, do_presto, overwrite, logger,
-                do_prithvi=False):
+                do_prithvi=False, emit_xy=False):
     win_dir = window_dir(dataset_path, healpix_id)
     y, g_transform, g_crs, gH, gW = load_gedi_dense(healpix_id, gedi_dir)
 
@@ -447,7 +482,11 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
                     emb_grid = reproject_to_grid(emb, src.transform, src.crs,
                                                  g_transform, g_crs, gH, gW)
                 save_dense_npz(out, emb_grid, y, g_transform, g_crs)
-                print(f"  Tile {healpix_id}: Prithvi -> {out.name}  X={emb_grid.shape}")
+                msg = f"  Tile {healpix_id}: Prithvi -> {out.name}  X={emb_grid.shape}"
+                if emit_xy:
+                    n = save_xy_npz(output_dir / "prithvi_xy", healpix_id, emb_grid, y)
+                    msg += f"  (+xy: {n} px)"
+                print(msg)
                 results["prithvi"] = "ok"
         else:
             results["prithvi"] = "skipped"
@@ -465,7 +504,11 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
                     emb_grid = reproject_to_grid(emb, src.transform, src.crs,
                                                  g_transform, g_crs, gH, gW)
                 save_dense_npz(out, emb_grid, y, g_transform, g_crs)
-                print(f"  Tile {healpix_id}: OLMo -> {out.name}  X={emb_grid.shape}")
+                msg = f"  Tile {healpix_id}: OLMo -> {out.name}  X={emb_grid.shape}"
+                if emit_xy:
+                    n = save_xy_npz(output_dir / "olmo_xy", healpix_id, emb_grid, y)
+                    msg += f"  (+xy: {n} px)"
+                print(msg)
                 results["olmo"] = "ok"
         else:
             results["olmo"] = "skipped"
@@ -481,7 +524,11 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
             else:
                 emb_grid = reproject_to_grid(emb_30, t30, s2_crs, g_transform, g_crs, gH, gW)
                 save_dense_npz(out, emb_grid, y, g_transform, g_crs)
-                print(f"  Tile {healpix_id}: Presto[{sampling}] -> {out.name}  X={emb_grid.shape}")
+                msg = f"  Tile {healpix_id}: Presto[{sampling}] -> {out.name}  X={emb_grid.shape}"
+                if emit_xy:
+                    n = save_xy_npz(output_dir / "presto_xy", healpix_id, emb_grid, y)
+                    msg += f"  (+xy: {n} px)"
+                print(msg)
                 results["presto"] = "ok"
         else:
             results["presto"] = "skipped"
@@ -525,8 +572,28 @@ def main():
     ap.add_argument("--skip-presto", action="store_true")
     ap.add_argument("--do-prithvi", action="store_true",
                     help="also run Prithvi-EO-2.0 predict + export healpix_<id>_prithvi.npz")
+    ap.add_argument("--prithvi-emb-dim", type=int, default=PRITHVI_EMB_DIM,
+                    help="num_bands for the prithvi_embeddings output layer in the built-in "
+                         f"dataset config (default {PRITHVI_EMB_DIM}). Set to the value rslearn's "
+                         "PrithviV2 actually writes if `model predict` errors on a band-count "
+                         "mismatch. Ignored when --dataset-config is provided.")
+    ap.add_argument("--crop-fraction", type=float, default=None, metavar="F",
+                    help="Shrink each tile's window to the central F of its width/height "
+                         "(F=0.1 -> ~1%% of the area) for a fast subset smoke test. The "
+                         "embeddings still reproject onto the full GEDI grid (only the "
+                         "cropped sub-window is covered). Not for production embeddings.")
+    ap.add_argument("--emit-xy", action="store_true",
+                    help="in addition to the dense healpix_<id>_<model>.npz, write the valid-"
+                         "GEDI-pixel (X,y) format to <output-dir>/<model>_xy/healpix_<id>_"
+                         "float32.npz, ready for run_gedi_prediction_30m.py --preprocessed-dir.")
+    ap.add_argument("--materialize-only", action="store_true",
+                    help="PHASE 1 (run on a CPU node): add_windows + prepare + materialize "
+                         "the shared S2/S1, then STOP before any model predict/encode. No "
+                         "GPU needed. Then run phase 2 on GPU with --skip-download.")
     ap.add_argument("--skip-download", action="store_true",
-                    help="dataset already materialized + OLMo predicted; only export npz")
+                    help="PHASE 2 (run on GPU): imagery already materialized; skip "
+                         "add_windows/prepare/materialize and go straight to Prithvi/OLMo "
+                         "predict + Presto encode + export, reusing the same --dataset-path.")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
@@ -535,10 +602,14 @@ def main():
     args = ap.parse_args()
 
     do_olmo, do_presto, do_prithvi = not args.skip_olmo, not args.skip_presto, args.do_prithvi
-    if do_olmo and not args.olmo_model_config and not args.skip_download and not args.dry_run:
-        ap.error("--olmo-model-config is required unless --skip-olmo, --skip-download, or --dry-run")
-    if do_prithvi and not args.prithvi_model_config and not args.skip_download and not args.dry_run:
-        ap.error("--prithvi-model-config is required with --do-prithvi unless --skip-download/--dry-run")
+    if (do_olmo and not args.olmo_model_config and not args.skip_download
+            and not args.materialize_only and not args.dry_run):
+        ap.error("--olmo-model-config is required unless --skip-olmo, --skip-download, "
+                 "--materialize-only, or --dry-run")
+    if (do_prithvi and not args.prithvi_model_config and not args.skip_download
+            and not args.materialize_only and not args.dry_run):
+        ap.error("--prithvi-model-config is required with --do-prithvi unless "
+                 "--skip-download, --materialize-only, or --dry-run")
 
     output_dir = Path(args.output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path(args.dataset_path)
@@ -569,12 +640,18 @@ def main():
         print(f"olmo         : {'predict --config ' + str(args.olmo_model_config) if do_olmo else 'SKIPPED'}")
         print(f"prithvi      : {'predict --config ' + str(args.prithvi_model_config) if do_prithvi else 'SKIPPED'}")
         print(f"presto       : {args.presto_sampling if do_presto else 'SKIPPED'}")
+        print(f"emit (X,y)   : {'yes -> <output-dir>/<model>_xy/healpix_<id>_float32.npz' if args.emit_xy else 'no'}")
+        if do_prithvi and not args.dataset_config:
+            print(f"prithvi dim  : num_bands={args.prithvi_emb_dim} (override via --prithvi-emb-dim)")
         print(f"window range : {args.year}-01-01 .. {args.year + 1}-01-01  (UTM, 10 m)")
         print(f"\n{len(tile_ids)} window(s):")
         for tid in tile_ids:
             minx, miny, maxx, maxy = pp.get_tile_bounds(tid, gdf)
             lon_min, lat_min, lon_max, lat_max = pp.bounds_to_crs(
                 minx, miny, maxx, maxy, shp_crs, CRS.from_epsg(4326))
+            if args.crop_fraction:
+                lon_min, lat_min, lon_max, lat_max = pp.crop_bounds_centered(
+                    lon_min, lat_min, lon_max, lat_max, args.crop_fraction)
             wd = window_dir(dataset_path, tid)
             gpath = next((str(gedi_dir / f"healpix_{tid}_gedi{e}")
                           for e in (".tif", ".tiff", "")
@@ -596,24 +673,43 @@ def main():
         print(f"\nTotal windows: {len(tile_ids)}. Re-run without --dry-run to execute.")
         return
 
-    # ----- Shared download + OLMo predict (once for all tiles) -----
+    # Ensure the shared dataset config.json is current — needed by BOTH the
+    # materialize (phase 1) and the model-predict (phase 2) steps, so it is written
+    # unconditionally (it is idempotent). This also makes --prithvi-emb-dim take
+    # effect in a predict-only (--skip-download) GPU run.
+    write_dataset_config(dataset_path, args.dataset_config,
+                         prithvi_emb_dim=args.prithvi_emb_dim if do_prithvi else None)
+
+    # ----- Phase 1: shared S2/S1 download (materialize ONCE) — CPU/IO bound -----
+    # Run this on a cheap CPU node. Skip it on the GPU run with --skip-download.
     if not args.skip_download:
-        write_dataset_config(dataset_path, args.dataset_config)
         print("\n=== Building shared dataset (add_windows) ===")
         for tid in tile_ids:
             minx, miny, maxx, maxy = pp.get_tile_bounds(tid, gdf)
             lon_min, lat_min, lon_max, lat_max = pp.bounds_to_crs(
                 minx, miny, maxx, maxy, shp_crs, CRS.from_epsg(4326))
+            if args.crop_fraction:
+                lon_min, lat_min, lon_max, lat_max = pp.crop_bounds_centered(
+                    lon_min, lat_min, lon_max, lat_max, args.crop_fraction)
             add_window(dataset_path, tid, lon_min, lat_min, lon_max, lat_max,
                        args.year, prefix, logger)
         print("\n=== prepare + materialize (download S2 + S1 ONCE) ===")
         prepare_materialize(dataset_path, args.workers, prefix, logger)
-        if do_olmo:
-            print("\n=== OLMo model predict ===")
-            olmo_predict(dataset_path, args.olmo_model_config, prefix, logger)
-        if do_prithvi:
-            print("\n=== Prithvi model predict ===")
-            prithvi_predict(dataset_path, args.prithvi_model_config, prefix, logger)
+
+    # Stop here after the (CPU) download so no GPU hours are spent on imagery I/O.
+    if args.materialize_only:
+        print(f"\n--materialize-only: S2/S1 materialized to {dataset_path}.\n"
+              f"Run the embedding phase on GPU with the SAME --dataset-path and "
+              f"--skip-download (+ --do-prithvi / --prithvi-model-config as needed).")
+        return
+
+    # ----- Phase 2: model predicts (reuse materialized imagery) — GPU -----
+    if do_olmo:
+        print("\n=== OLMo model predict ===")
+        olmo_predict(dataset_path, args.olmo_model_config, prefix, logger)
+    if do_prithvi:
+        print("\n=== Prithvi model predict ===")
+        prithvi_predict(dataset_path, args.prithvi_model_config, prefix, logger)
 
     # ----- Presto encoder (in-process) -----
     encoder = device = None
@@ -631,7 +727,8 @@ def main():
             results.append(export_tile(
                 tid, dataset_path, gedi_dir, output_dir, args.start_month,
                 args.presto_sampling, encoder, device, args.batch_size, args.block_rows,
-                do_olmo, do_presto, args.overwrite, logger, do_prithvi=do_prithvi))
+                do_olmo, do_presto, args.overwrite, logger, do_prithvi=do_prithvi,
+                emit_xy=args.emit_xy))
         except FileNotFoundError as exc:
             logger.warning("Tile %s: %s", tid, exc)
             results.append({"healpix_id": tid, "error": str(exc)})
