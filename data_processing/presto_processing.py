@@ -112,7 +112,7 @@ RSLEARN_GROUP = "presto"
 # group expects VV/VH in decibels; PC's Sentinel-1 RTC is linear gamma0, so we convert
 # (see s1_to_presto_db). Element84 has no S1, so S1 always comes from PC even when
 # --s2-source element84 (mixed per-layer sources are fine in one rslearn dataset).
-RSLEARN_S1_LAYER = "sentinel1"
+RSLEARN_S1_LAYER = "2"
 RSLEARN_S1_BANDS = ["vv", "vh"]
 S1_BANDSET_NAME = "_".join(RSLEARN_S1_BANDS)
 PRESTO_S1_BANDS = ["VV", "VH"]  # names construct_single_presto_input expects
