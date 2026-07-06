@@ -1,0 +1,86 @@
+# Prithvi-EO-2.0 (300M) embedding generation for the unified pipeline.
+#
+# Same `rslearn model predict` structure as your OLMo model-gpu.yaml, but the encoder is
+# rslearn's built-in PrithviV2 wrapper. Run via unified_embedding_pipeline.py --do-prithvi
+# --prithvi-model-config data_processing/prithvi_predict.yaml  (it sets DATASET_PATH and
+# then exports healpix_<id>_prithvi.npz aligned to the GEDI grid).
+#
+# Decisions baked in (from the build discussion): 300M model, 3 seasonal frames.
+#
+# THREE THINGS TO VERIFY against your installed rslearn (clearly flagged below):
+#   1. prithvi_embeddings `num_bands` in the dataset config must equal what PrithviV2
+#      actually writes (1024 vs 11*1024 — its forward concatenates per-block features but
+#      get_backbone_channels() reports 1024). If predict errors on a band-count mismatch,
+#      read the written geotiff's band count and set PRITHVI_EMB_DIM accordingly.
+#   2. crop_size should equal Prithvi's img_size (config["img_size"], typically 224); the
+#      wrapper interpolates each crop to img_size, so matching keeps the spatial math clean.
+#   3. merger downsample_factor must equal Prithvi's patch_size (config["patch_size"][-1],
+#      typically 16), and merger overlap_pixels = predict_config.overlap_pixels / patch_size.
+#
+# RESOLUTION CAVEAT: Prithvi-EO-2.0 was pretrained on 30 m HLS. The unified dataset is
+# materialized at 10 m, so with patch_size 16 each embedding covers a 160 m patch (16*10 m).
+# That's much coarser than GEDI's ~30 m. If you want Prithvi at its native scale, materialize
+# (or downsample) the S2 input to 30 m before predict.
+
+model:
+  class_path: rslearn.train.lightning_module.RslearnLightningModule
+  init_args:
+    model:
+      class_path: rslearn.models.singletask.SingleTaskModel
+      init_args:
+        encoder:
+          - class_path: rslearn.models.prithvi.PrithviV2
+            init_args:
+              size: VIT_300        # 300M (decision); use VIT_600 for the 600M model
+              num_frames: 3        # 3 seasonal frames (decision)
+        decoder:
+          - class_path: rslearn.train.tasks.embedding.EmbeddingHead
+    optimizer:
+      class_path: rslearn.train.optimizer.AdamW   # unused at predict, but required
+
+data:
+  class_path: rslearn.train.data_module.RslearnDataModule
+  init_args:
+    path: ${DATASET_PATH}
+    inputs:
+      # MUST be named "image" — PrithviV2.INPUT_KEY. Three monthly mosaics spread across
+      # the year approximate seasonal frames (true seasonal medians would need a
+      # compositing step). load_all_layers stacks them into the temporal axis (num_frames=3).
+      image:
+        data_type: "raster"
+        layers: ["sentinel2_l2a.3", "sentinel2_l2a.6", "sentinel2_l2a.9"]  # ~Apr / Jul / Oct
+        # Prithvi-EO-2.0 HLS 6-band order: Blue, Green, Red, Narrow-NIR, SWIR1, SWIR2.
+        bands: ["B02", "B03", "B04", "B8A", "B11", "B12"]
+        passthrough: true
+        dtype: FLOAT32
+        load_all_layers: true
+    task:
+      class_path: rslearn.train.tasks.embedding.EmbeddingTask
+    batch_size: 8
+    num_workers: 5   # GPU-shared gives ~5 cores/GPU; higher oversubscribes
+    predict_config:
+      transforms:
+        - class_path: rslearn.models.prithvi.PrithviNormalize
+          init_args:
+            size: VIT_300
+      load_all_crops: true
+      crop_size: 224          # VERIFY == Prithvi img_size (config["img_size"])
+      overlap_pixels: 32
+
+trainer:
+  # Single-device predict on the HPC GPU node. `strategy: auto` + `devices: 1`
+  # avoids DDP for a single GPU. (If you ever need a local CPU test on Apple
+  # Silicon, set `accelerator: cpu` — Lightning otherwise auto-selects MPS, and
+  # rslearn's default DDP strategy is not supported on MPS.)
+  accelerator: gpu
+  devices: 1
+  strategy: auto
+  callbacks:
+    - class_path: rslearn.train.prediction_writer.RslearnWriter
+      init_args:
+        output_layer: prithvi_embeddings   # matches PRITHVI_EMB_LAYER in the dataset config
+        merger:
+          class_path: rslearn.train.prediction_writer.RasterMerger
+          init_args:
+            overlap_pixels: 2     # = predict_config.overlap_pixels(32) / patch_size(16)
+            downsample_factor: 16 # = Prithvi patch_size; output res = input res / 16
