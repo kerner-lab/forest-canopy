@@ -110,6 +110,14 @@ OLMO_TO_PRESTO_BAND_IDX = [OLMO_S2_BANDS.index(b) for b in
 
 PRESTO_DOWNSAMPLE = 3  # 10 m -> 30 m
 
+# Sentinel-1 (optional, --with-s1): VV/VH materialized alongside S2 on the same
+# window grid, 12 monthly mosaics. Only Presto uses it (Prithvi is optical-only).
+# The dataset config must add a `sentinel1` layer (bands vv,vh) with the SAME 12-
+# month query_config as S2 so the S1/S2 monthly stacks align. PC S1 is linear
+# gamma0; Presto wants dB, so we convert via pp.s1_to_presto_db(units="linear").
+UNIFIED_S1_LAYER = "sentinel1"
+UNIFIED_S1_BANDSET = "_".join(["vv", "vh"])  # "vv_vh"
+
 # Prithvi-EO-2.0 (rslearn.models.prithvi.PrithviV2) output layer + embedding dim.
 # 300M -> see NOTE on the prithvi_embeddings layer below; set to what predict writes.
 PRITHVI_EMB_LAYER = "prithvi_embeddings"
@@ -301,6 +309,17 @@ def find_olmo_s2_geotiffs(win_dir: Path) -> list:
     return paths
 
 
+def find_unified_s1_geotiffs(win_dir: Path) -> list:
+    """The (up to 12) monthly sentinel1 VV/VH geotiffs for a window, temporal order."""
+    paths = []
+    for i in range(pp.PRESTO_NUM_TIMESTEPS):
+        layer = UNIFIED_S1_LAYER if i == 0 else f"{UNIFIED_S1_LAYER}.{i}"
+        p = win_dir / "layers" / layer / UNIFIED_S1_BANDSET / "geotiff.tif"
+        if p.exists():
+            paths.append(p)
+    return paths
+
+
 def find_olmo_embedding_geotiff(win_dir: Path) -> Path:
     """The OLMo embeddings geotiff written by RslearnWriter (128 bands, 30 m, UTM)."""
     emb_dir = win_dir / "layers" / "embeddings"
@@ -350,10 +369,17 @@ def reproject_to_grid(src, src_transform, src_crs, dst_transform, dst_crs, dst_h
 # ---------------------------------------------------------------------------
 
 def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
-                     encoder, device, batch_size: int, block_rows: int, logger):
+                     encoder, device, batch_size: int, block_rows: int, logger,
+                     with_s1: bool = False):
     """
     Returns (emb_30, transform_30, s2_crs) where emb_30 is (128, H30, W30) float32 in the S2
     UTM grid at 30 m, or (None, None, None) if no S2 imagery.
+
+    When with_s1 is set, the sentinel1 VV/VH monthly stack (same window grid, same 12
+    months) is loaded, converted to dB (pp.s1_to_presto_db), downsampled identically to
+    S2, and fed to Presto's S1 channel group. If S1 is missing, has a different month
+    count, or a different grid than S2, S1 is skipped for that tile (S2-only) with a
+    warning rather than failing.
     """
     paths = find_olmo_s2_geotiffs(win_dir)
     if not paths:
@@ -363,13 +389,32 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
     f = PRESTO_DOWNSAMPLE
     transform_30 = s2_transform * Affine.scale(f)               # 10 m -> 30 m pixels
 
+    # Optional Sentinel-1 stack (dB), aligned to the S2 grid + timesteps.
+    s1_full = None
+    if with_s1:
+        s1_paths = find_unified_s1_geotiffs(win_dir)
+        if len(s1_paths) != len(paths):
+            logger.warning("S1 has %d monthly geotiffs vs %d for S2 — skipping S1 (S2-only)",
+                           len(s1_paths), len(paths))
+        else:
+            s1_raw, _, _, s1H, s1W = pp.load_s2_stack(s1_paths)  # (T, 2, H, W)
+            if (s1H, s1W) != (H, W):
+                logger.warning("S1 grid (%d,%d) != S2 (%d,%d) — skipping S1", s1H, s1W, H, W)
+            else:
+                s1_full = pp.s1_to_presto_db(s1_raw, units="linear")  # (T, 2, H, W) dB
+                logger.info("Presto: feeding S1 (VV/VH) alongside S2")
+    s1_bands = pp.PRESTO_S1_BANDS if s1_full is not None else None
+
     if sampling in ("aggregate30", "nearest30"):
         if sampling == "aggregate30":
             s2_30 = block_mean(stack, f)                        # (T, 10, H30, W30)
+            s1_30 = block_mean(s1_full, f) if s1_full is not None else None
         else:  # nearest30: center pixel of each f x f block
             s2_30 = stack[:, :, 1::f, 1::f]
             H30, W30 = stack.shape[2] // f, stack.shape[3] // f
             s2_30 = s2_30[:, :, :H30, :W30]
+            s1_30 = (s1_full[:, :, 1::f, 1::f][:, :, :H30, :W30]
+                     if s1_full is not None else None)
             transform_30 = s2_transform * Affine.translation(1, 1) * Affine.scale(f)
         T, _, H30, W30 = s2_30.shape
         emb_30 = np.zeros((H30 * W30, pp.PRESTO_N_CHANNELS), dtype=np.float32)
@@ -382,7 +427,8 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
             rr, cc = rr.ravel(), cc.ravel()
             lls = pixel_latlons(rr, cc, transform_30, s2_crs)
             emb = pp.embed_pixels(s2_30, pp.PRESTO_S2_BANDS, rr, cc, lls,
-                                  start_month, encoder, device, batch_size, logger)
+                                  start_month, encoder, device, batch_size, logger,
+                                  s1_stack=s1_30, s1_band_names=s1_bands)
             emb_30[r0 * W30:r1 * W30] = emb
         emb_30 = emb_30.reshape(H30, W30, pp.PRESTO_N_CHANNELS).transpose(2, 0, 1)
         return emb_30, transform_30, s2_crs
@@ -390,6 +436,7 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
     # embed10_downsample: embed every 10 m pixel, scatter-average into the 30 m grid.
     H2, W2 = (H // f) * f, (W // f) * f
     stack = stack[:, :, :H2, :W2]
+    s1_10 = s1_full[:, :, :H2, :W2] if s1_full is not None else None
     H30, W30 = H2 // f, W2 // f
     acc = np.zeros((H30, W30, pp.PRESTO_N_CHANNELS), dtype=np.float64)
     cnt = np.zeros((H30, W30), dtype=np.int64)
@@ -402,7 +449,8 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
         rr, cc = rr.ravel(), cc.ravel()
         lls = pixel_latlons(rr, cc, s2_transform, s2_crs)
         emb = pp.embed_pixels(stack, pp.PRESTO_S2_BANDS, rr, cc, lls,
-                              start_month, encoder, device, batch_size, logger)
+                              start_month, encoder, device, batch_size, logger,
+                              s1_stack=s1_10, s1_band_names=s1_bands)
         r30, c30 = rr // f, cc // f
         np.add.at(acc, (r30, c30), emb)
         np.add.at(cnt, (r30, c30), 1)
@@ -462,7 +510,7 @@ def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid) -> int:
 
 def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sampling,
                 encoder, device, batch_size, block_rows, do_olmo, do_presto, overwrite, logger,
-                do_prithvi=False, emit_xy=False):
+                do_prithvi=False, emit_xy=False, with_s1=False):
     win_dir = window_dir(dataset_path, healpix_id)
     y, g_transform, g_crs, gH, gW = load_gedi_dense(healpix_id, gedi_dir)
 
@@ -517,7 +565,8 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
         out = output_dir / f"healpix_{healpix_id}_presto.npz"
         if overwrite or not out.exists():
             emb_30, t30, s2_crs = presto_dense_30m(
-                win_dir, start_month, sampling, encoder, device, batch_size, block_rows, logger)
+                win_dir, start_month, sampling, encoder, device, batch_size, block_rows, logger,
+                with_s1=with_s1)
             if emb_30 is None:
                 logger.warning("Tile %s: no S2 imagery for Presto", healpix_id)
                 results["presto"] = "no_imagery"
@@ -570,6 +619,10 @@ def main():
                     help="30 m rows per Presto block (memory/throughput tradeoff)")
     ap.add_argument("--skip-olmo", action="store_true")
     ap.add_argument("--skip-presto", action="store_true")
+    ap.add_argument("--with-s1", action="store_true",
+                    help="feed Sentinel-1 VV/VH (dB) alongside S2 into Presto. Requires a "
+                         "'sentinel1' layer (bands vv,vh, same 12-month query as S2) in the "
+                         "dataset config. Prithvi is optical-only and ignores this.")
     ap.add_argument("--do-prithvi", action="store_true",
                     help="also run Prithvi-EO-2.0 predict + export healpix_<id>_prithvi.npz")
     ap.add_argument("--prithvi-emb-dim", type=int, default=PRITHVI_EMB_DIM,
@@ -728,7 +781,7 @@ def main():
                 tid, dataset_path, gedi_dir, output_dir, args.start_month,
                 args.presto_sampling, encoder, device, args.batch_size, args.block_rows,
                 do_olmo, do_presto, args.overwrite, logger, do_prithvi=do_prithvi,
-                emit_xy=args.emit_xy))
+                emit_xy=args.emit_xy, with_s1=args.with_s1))
         except FileNotFoundError as exc:
             logger.warning("Tile %s: %s", tid, exc)
             results.append({"healpix_id": tid, "error": str(exc)})
