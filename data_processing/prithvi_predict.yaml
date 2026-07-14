@@ -7,20 +7,36 @@
 #
 # Decisions baked in (from the build discussion): 300M model, 3 seasonal frames.
 #
+# SPEED + RESOLUTION (why crop_size is 672, not 224):
+#   Prithvi-EO-2.0 was pretrained on 30 m HLS, but the shared dataset is materialized at
+#   10 m (and we do NOT want to re-materialize / write a second copy on the HPC). So we
+#   downsample to 30 m ON THE FLY at predict time, for free:
+#     - We read 672 px (= 3 * img_size) crops from the existing 10 m imagery. Each crop
+#       covers 672 * 10 m = 6720 m of ground.
+#     - PrithviV2._resize_data() ALWAYS bilinearly interpolates every crop to img_size
+#       (224) before patchifying (rslearn/models/prithvi.py). 6720 m squeezed into 224
+#       model pixels => 30 m effective GSD — Prithvi's native scale — computed in-memory
+#       on the GPU, nothing saved to disk.
+#     - Because each crop now covers 9x the ground (3x per side), the sliding window emits
+#       ~9x FEWER crops per healpix tile => ~9x fewer 300M-ViT forward passes. This is the
+#       dominant speedup; it is why per-tile Prithvi was slow (10 m crops = ~9x more crops,
+#       each a full 300M forward, and out of the model's trained distribution).
+#   CONSEQUENCE — coarser OUTPUT grid: with patch_size 16 at the 30 m effective GSD, each
+#   embedding token now covers 16 * 30 m = 480 m (was 16 * 10 m = 160 m at the old, wrong
+#   scale). export_tile reprojects these onto the GEDI grid regardless; they are simply
+#   coarser. This is inherent to a patch-16 ViT run at its native 30 m — you cannot get
+#   both native-scale input and fine output without overlapping/padded inference.
+#
 # THREE THINGS TO VERIFY against your installed rslearn (clearly flagged below):
 #   1. prithvi_embeddings `num_bands` in the dataset config must equal what PrithviV2
 #      actually writes (1024 vs 11*1024 — its forward concatenates per-block features but
 #      get_backbone_channels() reports 1024). If predict errors on a band-count mismatch,
 #      read the written geotiff's band count and set PRITHVI_EMB_DIM accordingly.
-#   2. crop_size should equal Prithvi's img_size (config["img_size"], typically 224); the
-#      wrapper interpolates each crop to img_size, so matching keeps the spatial math clean.
-#   3. merger downsample_factor must equal Prithvi's patch_size (config["patch_size"][-1],
-#      typically 16), and merger overlap_pixels = predict_config.overlap_pixels / patch_size.
-#
-# RESOLUTION CAVEAT: Prithvi-EO-2.0 was pretrained on 30 m HLS. The unified dataset is
-# materialized at 10 m, so with patch_size 16 each embedding covers a 160 m patch (16*10 m).
-# That's much coarser than GEDI's ~30 m. If you want Prithvi at its native scale, materialize
-# (or downsample) the S2 input to 30 m before predict.
+#   2. crop_size = 3 * img_size (672 = 3 * 224). If your config["img_size"] != 224, set
+#      crop_size = 3 * img_size and downsample_factor = crop_size * patch_size / img_size.
+#   3. merger downsample_factor = crop_size * patch_size / img_size = 672 * 16 / 224 = 48
+#      (output res = window res / ... i.e. 10 m * 48 = 480 m). merger overlap_pixels =
+#      predict_config.overlap_pixels / downsample_factor.
 
 model:
   class_path: rslearn.train.lightning_module.RslearnLightningModule
@@ -56,7 +72,12 @@ data:
         load_all_layers: true
     task:
       class_path: rslearn.train.tasks.embedding.EmbeddingTask
-    batch_size: 8
+    # batch_size raised 8 -> 16: the heavy transformer compute runs on the resized
+    # 224x224 crop (same activation memory as before), so the binding GPU-memory cost
+    # per sample is unchanged; the only larger tensor is the transient 672x672 input
+    # before _resize_data. Bump further if the GPU has headroom; drop back toward 8 if
+    # you hit OOM on the input-tensor transfer.
+    batch_size: 16
     num_workers: 5   # GPU-shared gives ~5 cores/GPU; higher oversubscribes
     predict_config:
       transforms:
@@ -64,14 +85,22 @@ data:
           init_args:
             size: VIT_300
       load_all_crops: true
-      crop_size: 224          # VERIFY == Prithvi img_size (config["img_size"])
-      overlap_pixels: 32
+      # 672 = 3 * img_size(224): read 3x-wider crops of the 10 m imagery so PrithviV2's
+      # internal resize downsamples them to 30 m GSD (see header). ~9x fewer crops/tile.
+      crop_size: 672
+      # Overlap dropped 32 -> 0: no redundant edge recompute (fastest). Adjacent 480 m
+      # patches abut exactly. If crop-boundary seams show up in the embeddings, set this
+      # to 96 and merger.overlap_pixels to 2 (96 / downsample_factor 48).
+      overlap_pixels: 0
 
 trainer:
   # Single-device predict on the HPC GPU node. `strategy: auto` + `devices: 1`
-  # avoids DDP for a single GPU. (If you ever need a local CPU test on Apple
-  # Silicon, set `accelerator: cpu` — Lightning otherwise auto-selects MPS, and
-  # rslearn's default DDP strategy is not supported on MPS.)
+  # avoids DDP for a single GPU. accelerator: gpu FORCES CUDA — if no GPU is visible
+  # the run errors out rather than silently falling back to CPU (which would be the
+  # other, catastrophic, reason "Prithvi is slow"). Confirm the job landed on a GPU:
+  # the predict log prints `GPU available: True ... LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES`.
+  # (For a local CPU smoke test on Apple Silicon set `accelerator: cpu` — Lightning
+  # otherwise auto-selects MPS, and rslearn's default DDP strategy is unsupported on MPS.)
   accelerator: gpu
   devices: 1
   strategy: auto
@@ -82,5 +111,5 @@ trainer:
         merger:
           class_path: rslearn.train.prediction_writer.RasterMerger
           init_args:
-            overlap_pixels: 2     # = predict_config.overlap_pixels(32) / patch_size(16)
-            downsample_factor: 16 # = Prithvi patch_size; output res = input res / 16
+            overlap_pixels: 0     # = predict_config.overlap_pixels(0) / downsample_factor
+            downsample_factor: 48 # = crop_size(672) * patch_size(16) / img_size(224); out res = 10 m * 48 = 480 m
