@@ -512,37 +512,72 @@ def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid) -> int:
     return int(len(yv))
 
 
+def prithvi_valid_xy_lowmem(emb_tif: Path, y_grid: np.ndarray, g_transform, g_crs,
+                            gH: int, gW: int, chunk_bands: int, logger):
+    """Reproject a large Prithvi embeddings geotiff onto the GEDI grid in BAND CHUNKS,
+    keeping only GEDI-valid, fully-finite pixels — WITHOUT ever holding the full dense
+    (C, gH, gW) grid in memory.
+
+    The dense grid is C * gH * gW * 4 bytes (e.g. ~25 GB for C=1024 on a ~2500 px tile,
+    ~275 GB for C=11264); allocating it is what OOM-killed export. GEDI coverage is sparse
+    (footprint tracks, not wall-to-wall), so we reproject `chunk_bands` bands at a time and
+    immediately subset to the GEDI-valid mask. Peak extra RAM is ~chunk_bands * gH * gW * 4
+    (one chunk grid) plus the final (N_valid, C) table, both far smaller than the dense grid.
+
+    Returns (Xv, yv, C): Xv (N, C) float32 embeddings, yv (N,) float32 heights, C band count.
+    """
+    mask = np.isfinite(y_grid)                         # (gH, gW) — sparse GEDI
+    yv = y_grid[mask].astype(np.float32)               # (N,)
+    with rasterio.open(emb_tif) as src:
+        C, st, sc = src.count, src.transform, src.crs
+        Xv = np.empty((int(mask.sum()), C), dtype=np.float32)
+        for c0 in range(0, C, chunk_bands):
+            c1 = min(c0 + chunk_bands, C)
+            # rasterio band indexes are 1-based; read only this chunk from disk.
+            emb_chunk = src.read(list(range(c0 + 1, c1 + 1))).astype(np.float32)  # (chunk,h,w)
+            grid = reproject_to_grid(emb_chunk, st, sc, g_transform, g_crs, gH, gW)  # (chunk,gH,gW)
+            Xv[:, c0:c1] = grid[:, mask].T             # (N, chunk)
+            del emb_chunk, grid
+        logger.info("Prithvi export: %d bands reprojected in chunks of %d; %d GEDI-valid px",
+                    C, chunk_bands, len(yv))
+    # Drop pixels that fell outside embedding coverage (NaN in any band).
+    finite = np.all(np.isfinite(Xv), axis=1)
+    return Xv[finite], yv[finite], C
+
+
 # ---------------------------------------------------------------------------
 # Per-tile export (after the shared materialize + OLMo predict)
 # ---------------------------------------------------------------------------
 
 def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sampling,
                 encoder, device, batch_size, block_rows, do_olmo, do_presto, overwrite, logger,
-                do_prithvi=False, emit_xy=False, with_s1=False):
+                do_prithvi=False, emit_xy=False, with_s1=False, prithvi_chunk_bands=64):
     win_dir = window_dir(dataset_path, healpix_id)
     y, g_transform, g_crs, gH, gW = load_gedi_dense(healpix_id, gedi_dir)
 
     results = {"healpix_id": int(healpix_id)}
 
     if do_prithvi:
-        out = output_dir / f"healpix_{healpix_id}_prithvi.npz"
-        if overwrite or not out.exists():
+        # Prithvi's embedding dim (1024+) makes a dense (C, gH, gW) grid at GEDI
+        # resolution enormous (~25 GB for C=1024 on a ~2500 px tile) — building it
+        # OOM-killed export. Since GEDI is sparse, we go straight to the (X, y) table
+        # via a band-chunked reproject and never form the dense grid. Output is the
+        # xy npz consumed by run_gedi_prediction_30m --preprocessed-dir.
+        xy_dir = output_dir / "prithvi_xy"
+        xy_out = xy_dir / f"healpix_{healpix_id}_float32.npz"
+        if overwrite or not xy_out.exists():
             emb_tif = find_prithvi_embedding_geotiff(win_dir)
             if emb_tif is None:
                 logger.warning("Tile %s: no Prithvi embeddings geotiff (predict may have skipped it)",
                                healpix_id)
                 results["prithvi"] = "missing_embeddings"
             else:
-                with rasterio.open(emb_tif) as src:
-                    emb = src.read().astype(np.float32)   # (C, h, w) UTM
-                    emb_grid = reproject_to_grid(emb, src.transform, src.crs,
-                                                 g_transform, g_crs, gH, gW)
-                save_dense_npz(out, emb_grid, y, g_transform, g_crs)
-                msg = f"  Tile {healpix_id}: Prithvi -> {out.name}  X={emb_grid.shape}"
-                if emit_xy:
-                    n = save_xy_npz(output_dir / "prithvi_xy", healpix_id, emb_grid, y)
-                    msg += f"  (+xy: {n} px)"
-                print(msg)
+                Xv, yv, C = prithvi_valid_xy_lowmem(
+                    emb_tif, y, g_transform, g_crs, gH, gW, prithvi_chunk_bands, logger)
+                xy_dir.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(xy_out, X=Xv.astype(np.float32), y=yv.astype(np.float32))
+                print(f"  Tile {healpix_id}: Prithvi (xy) -> {xy_out.name}  "
+                      f"N={len(yv)} px  C={C}")
                 results["prithvi"] = "ok"
         else:
             results["prithvi"] = "skipped"
@@ -632,7 +667,12 @@ def main():
                          "'sentinel1' layer (bands vv,vh, same 12-month query as S2) in the "
                          "dataset config. Prithvi is optical-only and ignores this.")
     ap.add_argument("--do-prithvi", action="store_true",
-                    help="also run Prithvi-EO-2.0 predict + export healpix_<id>_prithvi.npz")
+                    help="also run Prithvi-EO-2.0 predict + export the (X,y) table to "
+                         "<output-dir>/prithvi_xy/healpix_<id>_float32.npz")
+    ap.add_argument("--prithvi-chunk-bands", type=int, default=64,
+                    help="Prithvi export: number of embedding bands to reproject onto the "
+                         "GEDI grid at a time (default 64). Peak export RAM ~ this * gH * gW "
+                         "* 4 bytes; lower it (e.g. 32/16) if export OOMs on a big tile.")
     ap.add_argument("--prithvi-emb-dim", type=int, default=PRITHVI_EMB_DIM,
                     help="num_bands for the prithvi_embeddings output layer in the built-in "
                          f"dataset config (default {PRITHVI_EMB_DIM}). Set to the value rslearn's "
@@ -789,7 +829,8 @@ def main():
                 tid, dataset_path, gedi_dir, output_dir, args.start_month,
                 args.presto_sampling, encoder, device, args.batch_size, args.block_rows,
                 do_olmo, do_presto, args.overwrite, logger, do_prithvi=do_prithvi,
-                emit_xy=args.emit_xy, with_s1=args.with_s1))
+                emit_xy=args.emit_xy, with_s1=args.with_s1,
+                prithvi_chunk_bands=args.prithvi_chunk_bands))
         except FileNotFoundError as exc:
             logger.warning("Tile %s: %s", tid, exc)
             results.append({"healpix_id": tid, "error": str(exc)})
