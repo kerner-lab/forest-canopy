@@ -513,36 +513,66 @@ def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid) -> int:
 
 
 def prithvi_valid_xy_lowmem(emb_tif: Path, y_grid: np.ndarray, g_transform, g_crs,
-                            gH: int, gW: int, chunk_bands: int, logger):
-    """Reproject a large Prithvi embeddings geotiff onto the GEDI grid in BAND CHUNKS,
-    keeping only GEDI-valid, fully-finite pixels — WITHOUT ever holding the full dense
+                            gH: int, gW: int, chunk_bands: int, logger,
+                            reduce_blocks: str = "mean", block_dim: int = 1024):
+    """Reproject a Prithvi embeddings geotiff onto the GEDI grid in BAND CHUNKS, keeping
+    only GEDI-valid, fully-finite pixels — WITHOUT ever holding the full dense
     (C, gH, gW) grid in memory.
 
     The dense grid is C * gH * gW * 4 bytes (e.g. ~25 GB for C=1024 on a ~2500 px tile,
     ~275 GB for C=11264); allocating it is what OOM-killed export. GEDI coverage is sparse
-    (footprint tracks, not wall-to-wall), so we reproject `chunk_bands` bands at a time and
-    immediately subset to the GEDI-valid mask. Peak extra RAM is ~chunk_bands * gH * gW * 4
-    (one chunk grid) plus the final (N_valid, C) table, both far smaller than the dense grid.
+    (footprint tracks, not wall-to-wall), so we reproject bands in chunks and immediately
+    subset to the GEDI-valid mask.
 
-    Returns (Xv, yv, C): Xv (N, C) float32 embeddings, yv (N,) float32 heights, C band count.
+    BLOCK REDUCTION: rslearn's PrithviV2 concatenates the 11 transformer-block feature maps,
+    so the geotiff has C = n_blocks * block_dim bands (e.g. 11 * 1024 = 11264). Reprojecting
+    all 11264 bands is ~11x the work (a 30-min single-tile export). `reduce_blocks` collapses
+    the blocks to `block_dim` BEFORE the reproject (the source geotiff is small — read whole,
+    reduce, then reproject block_dim bands):
+      - "mean": average the n_blocks feature maps (default; standard multi-depth pooling)
+      - "last": keep only the final block's features
+      - "none": keep all C bands (slow/large)
+    Reduction only applies when C is an exact multiple of block_dim and n_blocks > 1.
+
+    Returns (Xv, yv, eff_C): Xv (N, eff_C) float32 embeddings, yv (N,) heights, eff_C the
+    band count actually written (block_dim if reduced, else C).
     """
     mask = np.isfinite(y_grid)                         # (gH, gW) — sparse GEDI
     yv = y_grid[mask].astype(np.float32)               # (N,)
     with rasterio.open(emb_tif) as src:
-        C, st, sc = src.count, src.transform, src.crs
-        Xv = np.empty((int(mask.sum()), C), dtype=np.float32)
-        for c0 in range(0, C, chunk_bands):
-            c1 = min(c0 + chunk_bands, C)
-            # rasterio band indexes are 1-based; read only this chunk from disk.
-            emb_chunk = src.read(list(range(c0 + 1, c1 + 1))).astype(np.float32)  # (chunk,h,w)
+        C, st, sc, h, w = src.count, src.transform, src.crs, src.height, src.width
+        n_blocks = C // block_dim if (block_dim and C % block_dim == 0) else 1
+        reduced = None
+        if reduce_blocks in ("mean", "last") and n_blocks > 1:
+            # Source is small (h,w ~ tile/48); read all bands once, then collapse blocks.
+            all_bands = src.read().astype(np.float32).reshape(n_blocks, block_dim, h, w)
+            reduced = all_bands.mean(axis=0) if reduce_blocks == "mean" else all_bands[-1]
+            del all_bands
+            eff_C = block_dim
+            logger.info("Prithvi export: %s-reduced %d bands (%d blocks x %d) -> %d before reproject",
+                        reduce_blocks, C, n_blocks, block_dim, eff_C)
+        else:
+            eff_C = C
+            if reduce_blocks in ("mean", "last"):
+                logger.info("Prithvi export: no block reduction (C=%d not a multiple of "
+                            "block_dim=%d, or single block)", C, block_dim)
+
+        Xv = np.empty((int(mask.sum()), eff_C), dtype=np.float32)
+        for c0 in range(0, eff_C, chunk_bands):
+            c1 = min(c0 + chunk_bands, eff_C)
+            if reduced is not None:
+                emb_chunk = reduced[c0:c1]
+            else:
+                # rasterio band indexes are 1-based; read only this chunk from disk.
+                emb_chunk = src.read(list(range(c0 + 1, c1 + 1))).astype(np.float32)  # (chunk,h,w)
             grid = reproject_to_grid(emb_chunk, st, sc, g_transform, g_crs, gH, gW)  # (chunk,gH,gW)
             Xv[:, c0:c1] = grid[:, mask].T             # (N, chunk)
             del emb_chunk, grid
         logger.info("Prithvi export: %d bands reprojected in chunks of %d; %d GEDI-valid px",
-                    C, chunk_bands, len(yv))
+                    eff_C, chunk_bands, len(yv))
     # Drop pixels that fell outside embedding coverage (NaN in any band).
     finite = np.all(np.isfinite(Xv), axis=1)
-    return Xv[finite], yv[finite], C
+    return Xv[finite], yv[finite], eff_C
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +581,8 @@ def prithvi_valid_xy_lowmem(emb_tif: Path, y_grid: np.ndarray, g_transform, g_cr
 
 def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sampling,
                 encoder, device, batch_size, block_rows, do_olmo, do_presto, overwrite, logger,
-                do_prithvi=False, emit_xy=False, with_s1=False, prithvi_chunk_bands=64):
+                do_prithvi=False, emit_xy=False, with_s1=False, prithvi_chunk_bands=64,
+                prithvi_reduce_blocks="mean", prithvi_block_dim=1024):
     win_dir = window_dir(dataset_path, healpix_id)
     y, g_transform, g_crs, gH, gW = load_gedi_dense(healpix_id, gedi_dir)
 
@@ -573,7 +604,8 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
                 results["prithvi"] = "missing_embeddings"
             else:
                 Xv, yv, C = prithvi_valid_xy_lowmem(
-                    emb_tif, y, g_transform, g_crs, gH, gW, prithvi_chunk_bands, logger)
+                    emb_tif, y, g_transform, g_crs, gH, gW, prithvi_chunk_bands, logger,
+                    reduce_blocks=prithvi_reduce_blocks, block_dim=prithvi_block_dim)
                 xy_dir.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(xy_out, X=Xv.astype(np.float32), y=yv.astype(np.float32))
                 print(f"  Tile {healpix_id}: Prithvi (xy) -> {xy_out.name}  "
@@ -673,6 +705,15 @@ def main():
                     help="Prithvi export: number of embedding bands to reproject onto the "
                          "GEDI grid at a time (default 64). Peak export RAM ~ this * gH * gW "
                          "* 4 bytes; lower it (e.g. 32/16) if export OOMs on a big tile.")
+    ap.add_argument("--prithvi-reduce-blocks", choices=["mean", "last", "none"], default="mean",
+                    help="rslearn's PrithviV2 stacks the 11 transformer-block feature maps "
+                         "(C = 11 * block-dim = 11264). Collapse them to block-dim BEFORE the "
+                         "reproject: 'mean' (default, ~11x faster export + smaller table), "
+                         "'last' (final block only), or 'none' (keep all 11264, slow/large).")
+    ap.add_argument("--prithvi-block-dim", type=int, default=PRITHVI_EMB_DIM,
+                    help=f"per-block Prithvi feature width for --prithvi-reduce-blocks "
+                         f"(default {PRITHVI_EMB_DIM}; VIT_300/600 use 1024). Reduction applies "
+                         "only when the geotiff band count is an exact multiple of this.")
     ap.add_argument("--prithvi-emb-dim", type=int, default=PRITHVI_EMB_DIM,
                     help="num_bands for the prithvi_embeddings output layer in the built-in "
                          f"dataset config (default {PRITHVI_EMB_DIM}). Set to the value rslearn's "
@@ -819,8 +860,8 @@ def main():
         encoder, device = pp.load_presto()
         print(f"Presto ready on {device}")
 
-    # ----- Per-tile dense export -----
-    print("\n=== Exporting dense per-tile embeddings ===")
+    # ----- Per-tile export (OLMo/Presto: dense (H,W,C); Prithvi: band-chunked (X,y) only) -----
+    print("\n=== Exporting per-tile embeddings ===")
     results = []
     iterator = tqdm(tile_ids, desc="export") if _HAS_TQDM else tile_ids
     for tid in iterator:
@@ -830,7 +871,9 @@ def main():
                 args.presto_sampling, encoder, device, args.batch_size, args.block_rows,
                 do_olmo, do_presto, args.overwrite, logger, do_prithvi=do_prithvi,
                 emit_xy=args.emit_xy, with_s1=args.with_s1,
-                prithvi_chunk_bands=args.prithvi_chunk_bands))
+                prithvi_chunk_bands=args.prithvi_chunk_bands,
+                prithvi_reduce_blocks=args.prithvi_reduce_blocks,
+                prithvi_block_dim=args.prithvi_block_dim))
         except FileNotFoundError as exc:
             logger.warning("Tile %s: %s", tid, exc)
             results.append({"healpix_id": tid, "error": str(exc)})
