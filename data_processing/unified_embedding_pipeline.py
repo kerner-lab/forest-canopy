@@ -285,9 +285,17 @@ def prithvi_predict(dataset_path: Path, model_config: str, prefix: list, logger)
     Identical mechanics to olmo_predict — rslearn's PrithviV2 encoder reads the same
     materialized Sentinel-2 (a 3-frame subset, 6 HLS bands) and the RslearnWriter in
     prithvi_predict.yaml writes embeddings into the `prithvi_embeddings` layer.
+
+    Speed note: prithvi_predict.yaml reads 3x-wider (672 px) crops of the existing 10 m
+    S2 so PrithviV2 downsamples them to 30 m in-memory (its native scale) — no second
+    copy of the imagery is written. That yields ~9x fewer 300M-ViT forward passes per
+    tile than 224 px crops at 10 m did (the reason Prithvi was slow). See the YAML header.
     """
     env = dict(os.environ)
     env["DATASET_PATH"] = str(dataset_path)
+    logger.info("Prithvi predict: reading 672 px crops -> 30 m on-the-fly downsample "
+                "(~9x fewer crops/tile). Watch the log for `GPU available: True` — a CPU "
+                "fallback would be the other reason it runs slow.")
     logger.info("Prithvi predict: if this fails with a band-count / num_bands mismatch, "
                 "note the expected value in the error and rerun with --prithvi-emb-dim <N> "
                 "(and --overwrite).")
