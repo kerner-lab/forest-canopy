@@ -72,12 +72,14 @@ data:
         load_all_layers: true
     task:
       class_path: rslearn.train.tasks.embedding.EmbeddingTask
-    # batch_size raised 8 -> 16: the heavy transformer compute runs on the resized
-    # 224x224 crop (same activation memory as before), so the binding GPU-memory cost
-    # per sample is unchanged; the only larger tensor is the transient 672x672 input
-    # before _resize_data. Bump further if the GPU has headroom; drop back toward 8 if
-    # you hit OOM on the input-tensor transfer.
-    batch_size: 16
+    # batch_size 1 (deliberately tiny). Each 672x672 crop is ~9x the RAM of a 224 crop
+    # (~65 MB as float32 x 6 bands x 3 frames). The old crop_size=224 full runs used
+    # batch_size 8 (~58 MB/batch) and fit this GPU-shared node's system-RAM slice; a
+    # 672-crop batch of 1 (~65 MB/batch) reproduces that same footprint. batch_size 16
+    # OOM-KILLED the node (cgroup oom on SYSTEM RAM, not CUDA VRAM). With only ~8 crops
+    # per tile now, a bigger batch buys ~nothing on throughput — only raise it (to 2-4)
+    # if you have confirmed RAM headroom.
+    batch_size: 1
     num_workers: 5   # GPU-shared gives ~5 cores/GPU; higher oversubscribes
     predict_config:
       transforms:
