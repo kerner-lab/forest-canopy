@@ -23,7 +23,29 @@ Usage:
 import argparse
 from pathlib import Path
 
-import geopandas as gpd
+import numpy as np
+
+# NOTE: geopandas is imported inside main(), not here. run_prithvi_embed.sh imports
+# validate_npz directly to check its resume guard, and that must stay a fast, dependency-
+# light import (geopandas costs seconds and is only needed to read the shapefile).
+
+
+def validate_npz(path: Path) -> str:
+    """Return an error string if `path` is not a fully readable .npz, else ""."""
+    # np.load is LAZY for .npz — it only opens the zip directory, so a truncated
+    # member does not raise until the array is actually read. Touch every array.
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            arrays = {k: z[k] for k in z.files}
+    except Exception as exc:                      # BadZipFile, EOFError, zlib error, ...
+        return f"unreadable ({type(exc).__name__}: {exc})"
+    if not arrays:
+        return "no arrays"
+    # X/y row mismatch means the write was cut between members even if the zip parsed.
+    X, y = arrays.get("X"), arrays.get("y")
+    if X is not None and y is not None and len(X) != len(y):
+        return f"X/y length mismatch ({len(X)} vs {len(y)})"
+    return ""
 
 
 def main():
@@ -41,7 +63,16 @@ def main():
                         help="Check the _withzeros cache (healpix_<ID>_<fmt>_withzeros.npz)")
     parser.add_argument("--out", default=None,
                         help="Optional path to write the missing healpix_ids (one per line)")
+    parser.add_argument("--validate", action="store_true",
+                        help="Open each present .npz and read every array, instead of just "
+                             "checking that the path exists. Corrupt files are reported "
+                             "separately and included in --out. Use this after a run that "
+                             "hit a disk quota / full filesystem: np.savez leaves a "
+                             "TRUNCATED but existing .npz, which a plain existence check "
+                             "(and the sbatch resume guard) will silently accept forever.")
     args = parser.parse_args()
+
+    import geopandas as gpd
 
     emb_dir = Path(args.dir)
     if not emb_dir.is_dir():
@@ -59,27 +90,42 @@ def main():
     tile_ids = [int(t) for t in gdf["healpix_id"].values]
 
     suffix = "_withzeros" if args.keep_zeros else ""
-    present, missing = [], []
+    present, missing, corrupt = [], [], []
     for tid in tile_ids:
         fname = f"healpix_{tid}_{args.embedding_format}{suffix}.npz"
-        if (emb_dir / fname).exists():
-            present.append(tid)
-        else:
+        path = emb_dir / fname
+        if not path.exists():
             missing.append(tid)
+            continue
+        if args.validate:
+            err = validate_npz(path)
+            if err:
+                corrupt.append((tid, err))
+                continue
+        present.append(tid)
 
     scope = f"splits={args.splits}" if args.splits else "all splits"
     print(f"Shapefile : {args.shapefile}  ({scope})")
     print(f"Directory : {emb_dir}")
     print(f"Filename  : healpix_<ID>_{args.embedding_format}{suffix}.npz")
+    print(f"Mode      : {'existence + validate' if args.validate else 'existence only'}")
     print(f"Present   : {len(present)}/{len(tile_ids)}")
     print(f"Missing   : {len(missing)}")
     if missing:
         preview = missing[:50]
         print(f"  {preview}{' ...' if len(missing) > 50 else ''}")
+    if args.validate:
+        print(f"Corrupt   : {len(corrupt)}")
+        for tid, err in corrupt[:50]:
+            print(f"  {tid}: {err}")
+        if len(corrupt) > 50:
+            print(f"  ... and {len(corrupt) - 50} more")
 
-    if args.out and missing:
-        Path(args.out).write_text("\n".join(str(t) for t in missing) + "\n")
-        print(f"Wrote {len(missing)} missing IDs -> {args.out}")
+    # A corrupt file must be re-run just like a missing one, so both go to --out.
+    rerun = sorted(missing + [tid for tid, _ in corrupt])
+    if args.out and rerun:
+        Path(args.out).write_text("\n".join(str(t) for t in rerun) + "\n")
+        print(f"Wrote {len(rerun)} IDs to re-run -> {args.out}")
 
 
 if __name__ == "__main__":

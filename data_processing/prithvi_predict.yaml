@@ -106,6 +106,13 @@ trainer:
   accelerator: gpu
   devices: 1
   strategy: auto
+  # Predict-only: no TensorBoard logger, no checkpoint dir. Without these, Lightning
+  # creates a `lightning_logs/version_N/` (config.yaml + hparams.yaml + tfevents) in the
+  # CWD on EVERY invocation — and the CWD is $WORKING_DIR on /jet/home, which has a 25 GB
+  # quota. Across a 180-task array that is pure quota burn (and an EDQUOT here kills the
+  # run inside RslearnLightningCLI construction, before a single crop is embedded).
+  logger: false
+  enable_checkpointing: false
   callbacks:
     - class_path: rslearn.train.prediction_writer.RslearnWriter
       init_args:

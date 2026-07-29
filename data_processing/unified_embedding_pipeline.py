@@ -630,7 +630,9 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
 
     if do_olmo:
         out = output_dir / f"healpix_{healpix_id}_olmo.npz"
-        if overwrite or not out.exists():
+        # Same xy-aware skip as the Presto branch below — see the comment there.
+        xy_out = output_dir / "olmo_xy" / f"healpix_{healpix_id}_float32.npz"
+        if overwrite or not out.exists() or (emit_xy and not xy_out.exists()):
             emb_tif = find_olmo_embedding_geotiff(win_dir)
             if emb_tif is None:
                 logger.warning("Tile %s: no OLMo embeddings geotiff (predict may have skipped it)", healpix_id)
@@ -648,11 +650,19 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
                 print(msg)
                 results["olmo"] = "ok"
         else:
+            print(f"  Tile {healpix_id}: OLMo SKIPPED — {out.name} already exists "
+                  f"(pass --overwrite to recompute)")
             results["olmo"] = "skipped"
 
     if do_presto:
         out = output_dir / f"healpix_{healpix_id}_presto.npz"
-        if overwrite or not out.exists():
+        xy_out = output_dir / "presto_xy" / f"healpix_{healpix_id}_float32.npz"
+        # Recompute if the dense npz is missing OR --emit-xy was asked for and the (X,y)
+        # file is missing. save_xy_npz runs ONLY in the compute branch below, so keying
+        # the skip on the dense npz alone means a tile first embedded without --emit-xy
+        # (or one whose xy write failed, e.g. on a full disk) can never produce its (X,y):
+        # every later run sees the dense file, skips, and exits 0 having written nothing.
+        if overwrite or not out.exists() or (emit_xy and not xy_out.exists()):
             emb_30, t30, s2_crs = presto_dense_30m(
                 win_dir, start_month, sampling, encoder, device, batch_size, block_rows, logger,
                 with_s1=with_s1)
@@ -669,6 +679,10 @@ def export_tile(healpix_id, dataset_path, gedi_dir, output_dir, start_month, sam
                 print(msg)
                 results["presto"] = "ok"
         else:
+            # Say so on STDOUT. A silent skip is indistinguishable in the slurm .out from
+            # a tile that failed, since every logger/tqdm line goes to stderr (.err).
+            print(f"  Tile {healpix_id}: Presto SKIPPED — {out.name} already exists "
+                  f"(pass --overwrite to recompute)")
             results["presto"] = "skipped"
 
     return results
