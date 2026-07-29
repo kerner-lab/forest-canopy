@@ -197,15 +197,29 @@ def setup_logging(output_dir: Path, verbose: bool) -> logging.Logger:
 
 def run_cmd(cmd: list, logger: logging.Logger, env: dict = None):
     """Run a subprocess, streaming output live to stdout + the log."""
+    def echo(text):
+        """Print, but never let a dead stdout kill the run.
+
+        On the HPC, stdout is the slurm .out file on a quota'd filesystem. If that
+        filesystem fills, `print` raises OSError(EDQUOT) from inside the streaming loop,
+        which masks the subprocess's ACTUAL failure and skips the `tail` diagnostic below.
+        Swallow it: the child's exit code is what we care about. (logging's FileHandler
+        already swallows its own IO errors, so the logger calls need no guard.)
+        """
+        try:
+            print(text, flush=True)
+        except OSError:
+            pass
+
     logger.info("cmd: %s", " ".join(cmd))
-    print(f"  $ {' '.join(cmd)}", flush=True)
+    echo(f"  $ {' '.join(cmd)}")
     from collections import deque
     tail = deque(maxlen=40)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env)
     for line in proc.stdout:
         line = line.rstrip("\n")
-        print(f"  | {line}", flush=True)
+        echo(f"  | {line}")
         logger.info("> %s", line)
         tail.append(line)
     rc = proc.wait()
