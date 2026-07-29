@@ -505,7 +505,7 @@ def save_dense_npz(out_path: Path, X_grid, y_grid, transform, crs):
     )
 
 
-def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid) -> int:
+def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid, hwc: bool = False) -> int:
     """Write the valid-GEDI-pixel (X, y) format consumed by
     run_gedi_prediction_30m.py --preprocessed-dir --embedding-format float32.
 
@@ -513,8 +513,13 @@ def save_xy_npz(xy_dir: Path, healpix_id: int, X_grid, y_grid) -> int:
     pixels with finite GEDI AND a fully finite embedding vector (drops no-coverage
     rows). File is named healpix_<id>_float32.npz so the per-model xy_dir can be
     passed straight to --preprocessed-dir. Returns the number of samples kept.
+
+    hwc=True means X_grid is ALREADY (H,W,C) — the layout save_dense_npz stores. That
+    lets make_xy_from_dense.py rebuild a missing xy file from an existing dense npz
+    through this exact function (no duplicated masking rules, and no full-size
+    transpose copy of a multi-GB array just to transpose it straight back).
     """
-    X_hwc = X_grid.transpose(1, 2, 0)                 # (H, W, C)
+    X_hwc = X_grid if hwc else X_grid.transpose(1, 2, 0)   # (H, W, C)
     mask = np.isfinite(y_grid)
     Xv = X_hwc[mask]                                   # (N, C)
     yv = y_grid[mask]                                  # (N,)
