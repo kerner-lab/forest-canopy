@@ -152,6 +152,15 @@ def main():
                     help="degrees to pad each window before aef subsetting (edge coverage)")
     ap.add_argument("--no-mask", action="store_true",
                     help="keep the full bounding box (default: mask pixels outside the polygon)")
+    ap.add_argument("--compress", default="lzw",
+                    help="GeoTIFF compression (lzw, deflate, none). Default lzw — see --predictor")
+    ap.add_argument("--predictor", type=int, default=0,
+                    help="TIFF predictor; 0 = none (default). deflate+predictor=3 (float "
+                         "predictor) can abort with 'double free / corruption' at GDAL close "
+                         "on some libtiff builds. That crash happens AFTER every block is "
+                         "written but BEFORE GDAL patches TileOffsets/TileByteCounts into the "
+                         "header, leaving a full-size .tif whose tiles all read as nodata and "
+                         "no sidecar .json. Only set this if you know your build is safe.")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the target grid + block count and exit (no S3 fetch)")
     args = ap.parse_args()
@@ -193,12 +202,16 @@ def main():
     profile = dict(
         driver="GTiff", dtype="float32", count=n_channels, crs=dst_crs,
         transform=transform, width=width, height=height, nodata=nodata,
-        compress="deflate", predictor=3, tiled=True, blockxsize=512, blockysize=512,
-        BIGTIFF="IF_SAFER",
+        tiled=True, blockxsize=512, blockysize=512, BIGTIFF="IF_SAFER",
     )
+    if args.compress and args.compress.lower() != "none":
+        profile["compress"] = args.compress
+        if args.predictor:
+            profile["predictor"] = args.predictor
 
     t0 = time.time()
     n_written = n_empty = 0
+    probe = None        # (window, row, col) of one pixel known to be finite when written
     with rasterio.open(out_path, "w", **profile) as dst:
         for b in range(n_channels):
             dst.set_band_description(b + 1, f"aef_ch_{b + 1:03d}")
@@ -228,6 +241,26 @@ def main():
 
             dst.write(block, window=win)
             n_written += 1
+            if probe is None:
+                fin = np.argwhere(np.isfinite(block[0]))
+                if len(fin):
+                    probe = (win, int(fin[0][0]), int(fin[0][1]))
+
+    # Verify the file actually finalized. If GDAL crashes at close (see --predictor), the
+    # tile data is on disk but TileOffsets/TileByteCounts stay all-zero: the .tif opens,
+    # reports the right size and CRS, and reads as ALL NODATA everywhere. Re-read one pixel
+    # that was finite when written — the cheapest possible proof that the index survived.
+    if probe is not None:
+        win, r, c = probe
+        with rasterio.open(out_path) as chk:
+            got = chk.read(1, window=Window(win.col_off + c, win.row_off + r, 1, 1))
+        if not np.isfinite(got).any():
+            sys.exit(f"ERROR: {out_path} did not finalize — a pixel that was finite when "
+                     f"written now reads as nodata. The tile index was not written (GDAL "
+                     f"likely crashed at close). Re-run with --compress lzw --predictor 0.")
+    elif n_written:
+        print("Warning: every written block was all-nodata; could not verify the file "
+              "finalized.", file=sys.stderr)
 
     elapsed = time.time() - t0
     size_mb = out_path.stat().st_size / 1e6
