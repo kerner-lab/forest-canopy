@@ -139,19 +139,31 @@ def fetch_covering_tiles(gt, lon_min, lat_min, lon_max, lat_max, year, buffer, l
 
     embedding is cast to float32 (C, H, W) ready for reprojection.
     """
+    blocks = list_covering_blocks(gt, lon_min, lat_min, lon_max, lat_max, year, buffer)
+    return list(iter_covering_tiles(gt, blocks, logger))
+
+
+def list_covering_blocks(gt, lon_min, lat_min, lon_max, lat_max, year, buffer):
+    """Registry-only lookup of the blocks covering the buffered bounds. No downloads."""
     bounds = (lon_min - buffer, lat_min - buffer,
               lon_max + buffer, lat_max + buffer)
-    tiles_to_fetch = gt.registry.load_blocks_for_region(bounds=bounds, year=year)
-    if not tiles_to_fetch:
-        return []
+    return gt.registry.load_blocks_for_region(bounds=bounds, year=year) or []
 
-    out = []
-    for record in gt.fetch_embeddings(tiles_to_fetch):
+
+def iter_covering_tiles(gt, blocks, logger):
+    """Yield (embedding(C,H,W) float32, crs, transform) ONE BLOCK AT A TIME.
+
+    Streaming matters: a single 0.1deg block is ~485 MB as float32 (1131 x 838 x 128),
+    so materialising every block of a full healpix tile in a list first costs ~44 GB for
+    a 90-block tile and gets the process oom-killed. Consuming this generator keeps only
+    one block live at a time, so peak memory is the reprojection accumulators plus ~0.5 GB.
+    """
+    if not blocks:
+        return
+    for record in gt.fetch_embeddings(blocks):
         # fetch_embeddings yields (year, tile_lon, tile_lat, embedding, crs, transform)
         _, _, _, emb, crs, transform = record
-        emb = _to_float32_chw(emb, logger)
-        out.append((emb, CRS.from_user_input(crs), transform))
-    return out
+        yield _to_float32_chw(emb, logger), CRS.from_user_input(crs), transform
 
 
 def _to_float32_chw(emb: np.ndarray, logger: logging.Logger) -> np.ndarray:
@@ -207,14 +219,17 @@ def reproject_tiles_to_gedi(
 
     0.0 is treated as nodata. Returns (C, gedi_height, gedi_width) float32.
     """
-    if not tiles:
-        return np.zeros((TESSERA_N_CHANNELS, gedi_height, gedi_width), dtype=np.float32)
-
-    n_channels = tiles[0][0].shape[0]
-    acc = np.zeros((n_channels, gedi_height, gedi_width), dtype=np.float32)
-    wsum = np.zeros((gedi_height, gedi_width), dtype=np.float32)
+    # `tiles` may be a LIST or a GENERATOR (see iter_covering_tiles). Nothing below
+    # indexes or re-iterates it, so streaming works unchanged — the accumulators are
+    # allocated lazily from the first block's channel count.
+    acc = wsum = None
+    n_channels = TESSERA_N_CHANNELS
 
     for emb, src_crs, src_transform in tiles:
+        if acc is None:
+            n_channels = emb.shape[0]
+            acc = np.zeros((n_channels, gedi_height, gedi_width), dtype=np.float32)
+            wsum = np.zeros((gedi_height, gedi_width), dtype=np.float32)
         dst = np.zeros((n_channels, gedi_height, gedi_width), dtype=np.float32)
         rasterio.warp.reproject(
             source=emb,
@@ -247,6 +262,10 @@ def reproject_tiles_to_gedi(
 
         acc += dst * weight[None, :, :]
         wsum += weight
+        del dst, weight, emb          # free before the next block is fetched
+
+    if acc is None:                   # no blocks at all
+        return np.zeros((TESSERA_N_CHANNELS, gedi_height, gedi_width), dtype=np.float32)
 
     mosaic = np.zeros((n_channels, gedi_height, gedi_width), dtype=np.float32)
     nz = wsum > 0
@@ -482,6 +501,7 @@ def process_tile(
     keep_zeros: bool = False,
     save_geotiff: bool = False,
     geotiff_bands=None,
+    dense: bool = False,
 ) -> dict:
     """Process one tile end-to-end; return a status dict.
 
@@ -493,7 +513,13 @@ def process_tile(
     """
     is_test = test_fraction is not None
     suffix = ("_withzeros" if keep_zeros else "") + ("_test" if is_test else "")
-    out_path = output_dir / f"healpix_{healpix_id}_float32{suffix}.npz"
+    if dense:
+        # Dense mode writes the whole reprojected grid, GEDI-unfiltered, under the same
+        # name/format the rest of the pipeline uses for dense embeddings — so
+        # make_xy_from_dense.py --model tessera can do the (X,y) filtering later.
+        out_path = output_dir / f"healpix_{healpix_id}_tessera{suffix}.npz"
+    else:
+        out_path = output_dir / f"healpix_{healpix_id}_float32{suffix}.npz"
     if not overwrite and out_path.exists():
         logger.info(f"Tile {healpix_id}: cached, skipping")
         return {"status": "skipped", "healpix_id": int(healpix_id)}
@@ -507,14 +533,20 @@ def process_tile(
             shp_minx, shp_miny, shp_maxx, shp_maxy, shp_crs, CRS.from_epsg(4326)
         )
 
-        # Crop to a fraction of the tile for fast local testing. Keep the NW
-        # corner so the subset still overlaps with real GEDI data.
+        # Crop to a fraction of the tile for fast local testing, CENTERED on the tile.
+        # This used to keep the NW corner, which is the worst choice for a coastal tile:
+        # TESSERA only covers land, so on a tile straddling the coast the NW corner is
+        # often pure ocean and the test returns "no TESSERA tiles cover bounds" — looking
+        # like a coverage failure when the tile is actually fine. The centre is far more
+        # likely to be land and to carry GEDI shots.
         if is_test:
             f = float(test_fraction)
-            lon_max = lon_min + (lon_max - lon_min) * f
-            lat_min = lat_max - (lat_max - lat_min) * f
+            lon_c, lat_c = (lon_min + lon_max) / 2, (lat_min + lat_max) / 2
+            half_lon, half_lat = (lon_max - lon_min) * f / 2, (lat_max - lat_min) * f / 2
+            lon_min, lon_max = lon_c - half_lon, lon_c + half_lon
+            lat_min, lat_max = lat_c - half_lat, lat_c + half_lat
             print(
-                f"  [test mode] fraction={f}  cropped WGS84 bounds: "
+                f"  [test mode] fraction={f} (centred)  cropped WGS84 bounds: "
                 f"({lon_min:.5f}, {lat_min:.5f}, {lon_max:.5f}, {lat_max:.5f})"
             )
 
@@ -525,28 +557,38 @@ def process_tile(
 
         # 2/3. Find + fetch + dequantize covering TESSERA tiles (each in its UTM CRS).
         t_fetch = time.time()
-        tiles = fetch_covering_tiles(
-            gt, lon_min, lat_min, lon_max, lat_max, year, buffer, logger
+        # Registry lookup first (cheap, no downloads) so an uncovered tile costs nothing,
+        # then STREAM the blocks into the reprojection instead of listing them. At ~485 MB
+        # per block as float32, listing a 90-block tile would need ~44 GB of RAM.
+        blocks = list_covering_blocks(
+            gt, lon_min, lat_min, lon_max, lat_max, year, buffer
         )
-        if not tiles:
+        if not blocks:
             logger.warning(f"Tile {healpix_id}: no TESSERA tiles cover bounds")
             return {"status": "empty_subset", "healpix_id": int(healpix_id)}
-        print(
-            f"  Tile {healpix_id}: fetched {len(tiles)} TESSERA tile(s) in "
-            f"{time.time() - t_fetch:.1f}s"
-        )
+        n_blocks = len(blocks)
+        print(f"  Tile {healpix_id}: streaming {n_blocks} TESSERA block(s)")
+        tiles = iter_covering_tiles(gt, blocks, logger)   # generator, one block live
 
         # 4. Load GEDI target geometry.
         gedi_data, gedi_nodata, gedi_transform, gedi_crs, gedi_h, gedi_w = \
             load_gedi_tile(healpix_id, gedi_dir)
 
-        # In test mode crop the GEDI raster to the same NW sub-window so the
-        # reprojection target is small and the QA coverage map is meaningful.
+        # In test mode crop the GEDI raster to the same CENTRED sub-window used for the
+        # lon/lat crop above. This must stay centred to match: cropping the NW corner
+        # here while fetching TESSERA for the centre gives a reprojection target that
+        # does not overlap the fetched data at all, and the tile reports
+        # "no_valid_pixels" no matter how much GEDI it actually contains.
+        # The transform has to be offset too, or the cropped grid is georeferenced as
+        # though it were still the tile's NW corner.
         if is_test:
             crop_h = max(1, int(round(gedi_h * test_fraction)))
             crop_w = max(1, int(round(gedi_w * test_fraction)))
-            gedi_data = gedi_data[:crop_h, :crop_w]
-            gedi_h, gedi_w = crop_h, crop_w
+            r0 = max(0, (gedi_h - crop_h) // 2)
+            c0 = max(0, (gedi_w - crop_w) // 2)
+            gedi_data = gedi_data[r0:r0 + crop_h, c0:c0 + crop_w]
+            gedi_transform = gedi_transform * Affine.translation(c0, r0)
+            gedi_h, gedi_w = gedi_data.shape
 
         # 5. Reproject + mosaic embeddings onto the GEDI 30 m grid.
         t_reproj = time.time()
@@ -554,7 +596,7 @@ def process_tile(
             tiles, gedi_transform, gedi_crs, gedi_h, gedi_w,
         )
         logger.info(
-            f"Tile {healpix_id}: reprojected {len(tiles)} tile(s) → {reproj.shape} "
+            f"Tile {healpix_id}: reprojected {n_blocks} tile(s) → {reproj.shape} "
             f"in {time.time() - t_reproj:.1f}s"
         )
 
@@ -565,6 +607,39 @@ def process_tile(
                 reproj, gedi_transform, gedi_crs, tif_path,
                 bands=geotiff_bands, logger=logger,
             )
+
+        # 6a. Dense mode: save the whole grid, GEDI-unfiltered, and stop. Same layout as
+        #     unified_embedding_pipeline.save_dense_npz — X (H,W,C), y (H,W) with NaN
+        #     where GEDI is invalid, plus the geo metadata needed to map it back — so
+        #     make_xy_from_dense.py --model tessera can extract (X,y) later without
+        #     re-fetching anything from GeoTessera.
+        if dense:
+            y_grid = np.full(gedi_data.shape, np.nan, dtype=np.float32)
+            gedi_valid = (
+                (gedi_data != gedi_nodata) &
+                (gedi_data >= 0 if keep_zeros else gedi_data > 0) &
+                (gedi_data < GEDI_MAX_HEIGHT_CM)
+            )
+            y_grid[gedi_valid] = gedi_data[gedi_valid] / 100.0     # cm -> m
+            np.savez_compressed(
+                out_path,
+                X=np.ascontiguousarray(reproj.transpose(1, 2, 0)),  # (H, W, C)
+                y=y_grid,
+                grid_transform=np.asarray(tuple(gedi_transform)[:6], dtype=np.float64),
+                grid_crs=np.asarray(CRS.from_user_input(gedi_crs).to_wkt()),
+                grid_shape=np.asarray(y_grid.shape, dtype=np.int32),
+            )
+            mb = out_path.stat().st_size / 1e6
+            covered = float(np.any(reproj != 0.0, axis=0).mean())
+            print(f"  Tile {healpix_id}: dense -> {out_path.name}  "
+                  f"X={(gedi_h, gedi_w, reproj.shape[0])}  {mb:.1f} MB  "
+                  f"embedding coverage {100*covered:.1f}%  GEDI px {int(gedi_valid.sum()):,}")
+            return {"status": "dense_ok", "healpix_id": int(healpix_id),
+                    "shape": [gedi_h, gedi_w, int(reproj.shape[0])],
+                    "size_mb": round(mb, 1),
+                    "embedding_coverage": round(covered, 4),
+                    "n_gedi_px": int(gedi_valid.sum()),
+                    "elapsed_s": round(time.time() - t_start, 1)}
 
         # 6. Extract valid GEDI pixels. With keep_zeros, 0-height measurements are
         #    retained (gedi_data >= 0); otherwise only strictly-positive heights.
@@ -726,7 +801,22 @@ def main():
     parser.add_argument("--dataset-version", default=None,
                         help="GeoTessera dataset version (e.g. v1.1); default: library default")
     parser.add_argument("--check-only", action="store_true",
-                        help="Report cache coverage and exit without processing")
+                        help="Report which output .npz files already exist in --output-dir "
+                             "and exit. This is a LOCAL cache check only — it never contacts "
+                             "GeoTessera. Use --check-coverage to ask whether TESSERA has "
+                             "data for a year.")
+    parser.add_argument("--check-coverage", action="store_true",
+                        help="Ask the GeoTessera registry how many precomputed tiles cover "
+                             "each healpix tile for --year, and exit without downloading "
+                             "embeddings. This is the real answer to 'does TESSERA have "
+                             "2019 over my AOI'. Registry query only; no embedding fetches.")
+    parser.add_argument(
+        "--dense", action="store_true",
+        help="Save the FULL reprojected grid (GEDI-unfiltered) as "
+             "healpix_<id>_tessera.npz instead of the (X,y) pairs. Same dense layout "
+             "as the rest of the pipeline, so make_xy_from_dense.py --model tessera can "
+             "do the filtering later. WARNING: 128 channels x the full GEDI grid is "
+             "GB-scale per tile — check the reported size on one tile before batching.")
     parser.add_argument("--qa", action="store_true",
                         help="Save per-tile diagnostic plots and stats after processing")
     parser.add_argument("--qa-dir", default=None,
@@ -799,6 +889,38 @@ def main():
     print("\nOpening GeoTessera (lazy)...")
     gt = open_geotessera(cache_dir=args.cache_dir, dataset_version=args.dataset_version)
 
+    if args.check_coverage:
+        # Registry lookup only — load_blocks_for_region returns the identifiers of the
+        # 0.1deg precomputed tiles covering the bounds, without fetching any embeddings.
+        # A tile with 0 blocks has no TESSERA data for that year, full stop.
+        shp_crs = gdf.crs if gdf.crs is not None else CRS.from_epsg(4326)
+        covered, uncovered = [], []
+        print(f"\nQuerying TESSERA registry for year {args.year} over {len(tile_ids)} tiles...")
+        for i, tid in enumerate(tile_ids, 1):
+            lon_min, lat_min, lon_max, lat_max = bounds_to_crs(
+                *get_tile_bounds(tid, gdf), shp_crs, CRS.from_epsg(4326))
+            bounds = (lon_min - args.buffer, lat_min - args.buffer,
+                      lon_max + args.buffer, lat_max + args.buffer)
+            try:
+                blocks = gt.registry.load_blocks_for_region(bounds=bounds, year=args.year)
+                n = len(blocks) if blocks else 0
+            except Exception as exc:
+                print(f"  healpix_{tid}: registry error — {type(exc).__name__}: {exc}")
+                n = 0
+            (covered if n else uncovered).append((tid, n))
+            print(f"[{i}/{len(tile_ids)}] healpix_{tid}: {n} TESSERA block(s)",
+                  file=sys.stderr, flush=True)
+        print(f"\nYear {args.year}: {len(covered)}/{len(tile_ids)} tiles have coverage")
+        if covered:
+            ns = [n for _t, n in covered]
+            print(f"  blocks per covered tile: min={min(ns)} max={max(ns)} "
+                  f"mean={sum(ns)/len(ns):.1f}")
+        if uncovered:
+            ids = [t for t, _n in uncovered]
+            print(f"  NO coverage ({len(ids)}): {ids[:20]}"
+                  f"{' ...' if len(ids) > 20 else ''}")
+        return
+
     # Process tiles
     gedi_dir = Path(args.gedi_dir)
     results = []
@@ -815,6 +937,7 @@ def main():
             overwrite=args.overwrite,
             buffer=args.buffer,
             logger=logger,
+            dense=args.dense,
             do_qa=args.qa,
             qa_dir=qa_dir,
             test_fraction=args.test_fraction,
