@@ -488,17 +488,24 @@ def load_s2_stack(geotiff_paths: list):
     transform/crs. All months must share the same grid (rslearn guarantees this for
     one window). Returns (stack, transform, crs, height, width).
     """
-    arrays, transform, crs, H, W = [], None, None, None, None
-    for p in geotiff_paths:
+    # Preallocate and fill in place. The obvious version — collect each month into a list
+    # and np.stack() it — holds the list AND the stacked copy live at the same moment, so
+    # peak RSS is 2x the final array. At 12 months x 12 bands x a 10 m healpix window that
+    # doubling is tens of GB and gets the job oom-killed by the slurm cgroup. Filling a
+    # preallocated array keeps the peak at 1x plus one month's read buffer.
+    stack, transform, crs, H, W = None, None, None, None, None
+    for i, p in enumerate(geotiff_paths):
         with rasterio.open(p) as src:
-            arr = src.read().astype(np.float32)  # (bands, H, W)
-            if transform is None:
+            if stack is None:
                 transform, crs, H, W = src.transform, src.crs, src.height, src.width
+                stack = np.empty((len(geotiff_paths), src.count, H, W), dtype=np.float32)
             elif (src.height, src.width) != (H, W):
                 raise ValueError(f"Month grid mismatch in {p.name}: "
                                  f"{(src.height, src.width)} vs {(H, W)}")
-        arrays.append(arr)
-    stack = np.stack(arrays, axis=0)  # (T, bands, H, W)
+            elif src.count != stack.shape[1]:
+                raise ValueError(f"Month band-count mismatch in {p.name}: "
+                                 f"{src.count} vs {stack.shape[1]}")
+            stack[i] = src.read()          # (bands, H, W), cast to float32 on assignment
     return stack, transform, crs, H, W
 
 
