@@ -1,0 +1,71 @@
+Repair self-intersecting STAC item footprints before clipping them in WGS84.
+
+Symptom (Phase 1, --with-s1):
+    shapely.errors.GEOSException: TopologyException: side location conflict at
+    -118.92514736712955 44.376983527204914. This can occur if the input geometry
+    is invalid.
+raised from safely_reproject_within_valid_area() via _filter_and_project_items()
+-> match_candidate_items_to_window() -> get_items(). Some Sentinel-1 GRD swath
+polygons served by Planetary Computer are self-intersecting; GEOS refuses to
+intersect them. Sentinel-2 (Element84) footprints are simple boxes, so only the
+sentinel1 layer trips this.
+
+Impact without the patch: the exception escapes get_items() for the WHOLE window,
+so `rslearn dataset prepare` (which defaults to --ignore-errors) drops the entire
+sentinel1 layer from items.json -- all 12 monthly groups, not just the bad scene.
+`materialize` then logs "Not materializing layer sentinel1 ... because it is not
+prepared" and the tile silently ends up S2-only. Retries do not help: the same
+invalid polygon comes back from the STAC API every attempt.
+
+The fix mirrors the fallback shp_intersects() already applies a few lines above in
+the same file (geometry.py:42-45) -- it catches shapely.GEOSException there but not
+on the .intersection() call that actually throws.
+
+Apply on Bridges-2:
+    SITE=/jet/home/kdoerkse/.conda/envs/jpl/lib/python3.11/site-packages
+    cp $SITE/rslearn/utils/geometry.py $SITE/rslearn/utils/geometry.py.bak
+    patch -p1 -d $SITE < data_processing/rslearn_invalid_geom.patch
+
+Verify:
+    python -c "import inspect; from rslearn.utils import geometry; \
+        print('make_valid' in inspect.getsource(geometry.safely_reproject_within_valid_area))"
+
+Re-applying after a conda env rebuild is required; `patch` refuses to apply twice.
+
+diff --git a/rslearn/utils/geometry.py b/rslearn/utils/geometry.py
+--- a/rslearn/utils/geometry.py
++++ b/rslearn/utils/geometry.py
+@@ -/-/ +/-/ @@ def safely_reproject_within_valid_area(
+         if not shp_intersects(src_wgs84.shp, valid_wgs84.shp):
+             results.append(None)
+             continue
+
+         # Clip in WGS84 to the buffered valid area so we only reproject a small piece.
+-        clipped_shp = src_wgs84.shp.intersection(get_clip_region())
++        try:
++            clipped_shp = src_wgs84.shp.intersection(get_clip_region())
++        except shapely.GEOSException:
++            # Self-intersecting source footprint (seen on Sentinel-1 GRD swaths):
++            # GEOS raises "side location conflict" rather than returning a result.
++            # Repair the rings and retry, as shp_intersects() does above.
++            repaired = shapely.make_valid(src_wgs84.shp)
++            clipped_shp = repaired.intersection(get_clip_region())
++            # make_valid can emit a GeometryCollection mixing polygons with the
++            # degenerate lines/points it split out. Downstream expects an areal
++            # geometry, so keep only the polygonal parts.
++            if clipped_shp.geom_type == "GeometryCollection":
++                polys = [
++                    g
++                    for g in clipped_shp.geoms
++                    if g.geom_type in ("Polygon", "MultiPolygon")
++                ]
++                clipped_shp = (
++                    shapely.unary_union(polys) if polys else shapely.Polygon()
++                )
++            logger.warning(
++                "repaired invalid source geometry before clipping (was %s)",
++                shapely.is_valid_reason(src_wgs84.shp),
++            )
+         if clipped_shp.is_empty:
+             results.append(None)
+             continue
