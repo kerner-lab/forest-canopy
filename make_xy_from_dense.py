@@ -41,7 +41,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", required=True,
                     help="the pipeline --output-dir holding healpix_<id>_presto.npz")
-    ap.add_argument("--model", default="presto", choices=["presto", "olmo"],
+    ap.add_argument("--model", default="presto", choices=["presto", "olmo", "tessera"],
                     help="which dense files to convert (default: presto). Reads "
                          "healpix_<id>_<model>.npz, writes <model>_xy/healpix_<id>_float32.npz")
     ap.add_argument("--healpix-id", type=int, default=None,

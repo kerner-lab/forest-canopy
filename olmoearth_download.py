@@ -388,6 +388,225 @@ def cmd_crop(session, args):
                 print(f"[{i}/{len(files)}] {name}: FAILED ({e})", file=sys.stderr)
 
 
+NAME_FIELD_CANDIDATES = (
+    "healpix", "healpix_id", "hp_id", "hpx", "ipix", "pix", "pixel",
+    "tile", "tile_id", "tileid", "cell", "cell_id", "name", "id",
+)
+
+
+def guess_name_field(columns):
+    lower = {c.lower(): c for c in columns}
+    for cand in NAME_FIELD_CANDIDATES:
+        if cand in lower:
+            return lower[cand]
+    return None
+
+
+def sanitize(value):
+    s = str(value).strip()
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s) or "unnamed"
+
+
+def bbox_overlaps(a, b):
+    return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+
+class Sources:
+    """Open remote COGs, grouped by CRS, with signed-URL re-minting."""
+
+    def __init__(self, session, args, rasterio):
+        self.session, self.args, self.rasterio = session, args, rasterio
+        self.datasets, self.groups, self.opened_at = [], {}, 0.0
+
+    def open(self):
+        from collections import defaultdict
+
+        self.close()
+        files, _ = fetch_result_files(self.session, self.args)
+        self.datasets = []
+        for name, url, _ in files:
+            try:
+                self.datasets.append(self.rasterio.open(f"/vsicurl/{url}"))
+            except Exception as e:
+                print(f"  cannot open {name}: {e}", file=sys.stderr)
+        groups = defaultdict(list)
+        for ds in self.datasets:
+            groups[str(ds.crs)].append(ds)
+        self.groups = dict(groups)
+        self.opened_at = time.time()
+        print(
+            f"  {len(self.datasets)} source COG(s) across "
+            f"{len(self.groups)} CRS: {', '.join(self.groups)}"
+        )
+
+    def maybe_refresh(self, minutes):
+        if minutes and time.time() - self.opened_at > minutes * 60:
+            print("  signed URLs going stale, re-minting...")
+            self.open()
+            return True
+        return False
+
+    def close(self):
+        for ds in self.datasets:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        self.datasets = []
+
+
+def cmd_tiles(session, args):
+    """Cut one output per polygon in a tiling shapefile, named after the tile."""
+    try:
+        import geopandas as gpd
+        import rasterio
+        from rasterio.features import geometry_mask
+        from rasterio.merge import merge as rio_merge
+    except ImportError as e:
+        sys.exit(f"tiles needs rasterio + geopandas:  pip install rasterio geopandas  ({e})")
+
+    import csv
+
+    tiles = gpd.read_file(args.shapefile)
+    if tiles.crs is None:
+        sys.exit("Shapefile has no CRS. Set one (e.g. with --tile-crs) before proceeding.")
+    if args.tile_crs:
+        tiles = tiles.set_crs(args.tile_crs, allow_override=True)
+
+    field = args.name_field or guess_name_field(tiles.columns)
+    if not field:
+        sys.exit(f"Could not guess the tile-name column. Columns: {list(tiles.columns)}\n"
+                 f"Pass --name-field.")
+    print(f"Naming tiles from column '{field}' ({len(tiles)} features)")
+
+    names = [sanitize(v) for v in tiles[field]]
+    if len(set(names)) != len(names):
+        print("  WARNING: tile names are not unique -- outputs will collide.", file=sys.stderr)
+
+    bands = parse_bands(args.bands)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest_rows = []
+
+    env = rasterio.Env(
+        GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+        GDAL_HTTP_MULTIRANGE="YES",
+        GDAL_HTTP_MERGE_CONSECUTIVE_RANGES="YES",
+        VSI_CACHE="TRUE",
+        VSI_CACHE_SIZE="536870912",
+    )
+
+    src = Sources(session, args, rasterio)
+    with env:
+        src.open()
+        if not src.datasets:
+            sys.exit("No readable source COGs.")
+        crs_keys = list(src.groups)
+        multi_crs = len(crs_keys) > 1
+
+        for crs_key in crs_keys:
+            projected = tiles.to_crs(crs_key)
+            print(f"\n[{crs_key}]")
+            for i, (_, row) in enumerate(projected.iterrows(), 1):
+                tile_name = sanitize(row[field])
+                suffix = f"__{crs_key.replace(':', '')}" if multi_crs else ""
+                dest = out / args.name_template.format(tile=tile_name + suffix)
+
+                if dest.exists() and not args.overwrite:
+                    continue
+
+                if src.maybe_refresh(args.refresh_min):
+                    pass
+                group = src.groups.get(crs_key, [])
+
+                geom = row.geometry
+                if geom is None or geom.is_empty:
+                    continue
+                bounds = geom.bounds
+                hits = [d for d in group if bbox_overlaps(d.bounds, bounds)]
+                if not hits:
+                    continue
+
+                try:
+                    nodata = args.nodata
+                    if nodata is None:
+                        nodata = next((d.nodata for d in hits if d.nodata is not None), None)
+                    arr, transform = rio_merge(
+                        hits, bounds=bounds, nodata=nodata, indexes=bands
+                    )
+                    if arr.size == 0:
+                        continue
+
+                    if args.clip:
+                        outside = geometry_mask(
+                            [geom.__geo_interface__],
+                            out_shape=arr.shape[1:],
+                            transform=transform,
+                            invert=False,
+                        )
+                        if nodata is not None:
+                            arr[:, outside] = nodata
+
+                    prof = hits[0].profile.copy()
+                    prof.update(
+                        driver="GTiff",
+                        height=arr.shape[1],
+                        width=arr.shape[2],
+                        count=arr.shape[0],
+                        transform=transform,
+                        crs=crs_key,
+                        nodata=nodata,
+                        tiled=True,
+                        blockxsize=512,
+                        blockysize=512,
+                        compress="deflate",
+                        predictor=2,
+                    )
+                    prof.pop("blockysize", None) if arr.shape[1] < 512 else None
+                    with rasterio.open(dest, "w", **prof) as dst:
+                        dst.write(arr)
+                        dst.update_tags(
+                            healpix_tile=str(row[field]),
+                            source_field=field,
+                            n_source_cogs=str(len(hits)),
+                        )
+
+                    manifest_rows.append(
+                        {
+                            "tile": str(row[field]),
+                            "file": dest.name,
+                            "crs": crs_key,
+                            "width": arr.shape[2],
+                            "height": arr.shape[1],
+                            "bands": arr.shape[0],
+                            "n_sources": len(hits),
+                            "bytes": dest.stat().st_size,
+                        }
+                    )
+                    print(
+                        f"  [{i}/{len(projected)}] {dest.name}: "
+                        f"{arr.shape[2]}x{arr.shape[1]} px, {arr.shape[0]} band(s), "
+                        f"{len(hits)} source(s), {human(dest.stat().st_size)}"
+                    )
+                except Exception as e:
+                    print(f"  [{i}/{len(projected)}] {tile_name}: FAILED ({e})", file=sys.stderr)
+
+        src.close()
+
+    if manifest_rows:
+        mpath = out / "manifest.csv"
+        with open(mpath, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(manifest_rows[0]))
+            w.writeheader()
+            w.writerows(manifest_rows)
+        print(f"\n{len(manifest_rows)} tile(s) written. Manifest: {mpath}")
+        missing = len(tiles) - len({r['tile'] for r in manifest_rows})
+        if missing > 0:
+            print(f"{missing} tile(s) produced no output (no overlap, or failed).")
+    else:
+        print("\nNothing written -- check that the tiling and the COGs actually overlap.")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--api-key", default=os.environ.get("OLMOEARTH_API_KEY"))
@@ -414,6 +633,24 @@ def main():
             sp.add_argument("--geojson", help="AOI file; its bounding box is used")
             sp.add_argument("--bands", help="e.g. 1-64,100,200-204 (1-indexed)")
         sp.set_defaults(func=fn)
+
+    sp = sub.add_parser("tiles", help="cut one output per polygon in a tiling shapefile")
+    sp.add_argument("--prediction-id", nargs="+", help="one or more prediction UUIDs")
+    sp.add_argument("--project-id")
+    sp.add_argument("--match", help="regex; only read source files that match")
+    sp.add_argument("--shapefile", required=True, help=".shp/.gpkg/.geojson of tile polygons")
+    sp.add_argument("--name-field", help="column holding the tile name (auto-detected if omitted)")
+    sp.add_argument("--tile-crs", help="override the shapefile CRS, e.g. EPSG:4326")
+    sp.add_argument("--name-template", default="{tile}.tif")
+    sp.add_argument("--bands", help="e.g. 1-64,100 (1-indexed)")
+    sp.add_argument("--clip", action="store_true",
+                    help="mask to the polygon, not just its bounding box")
+    sp.add_argument("--nodata", type=float, help="override nodata (OlmoEarth int8 uses -128)")
+    sp.add_argument("--overwrite", action="store_true")
+    sp.add_argument("--refresh-min", type=float, default=30.0,
+                    help="re-mint signed URLs every N minutes (0 to disable)")
+    sp.add_argument("--out", default="./by_tile")
+    sp.set_defaults(func=cmd_tiles)
 
     args = p.parse_args()
     if not args.api_key:

@@ -101,8 +101,13 @@ def main():
     if not tiles:
         sys.exit(f"No healpix_* directories found under {rslearn_dir}")
 
+    # Progress goes to STDERR so the summary table on stdout stays clean and pipeable.
+    # Without this the script looks hung: validating a GB-scale dense Presto npz takes
+    # ~10-20 s per tile, and the table below is only printed once every tile is done.
     reclaimable, blocked = [], []
-    for tid, tile_dir in tiles:
+    n = len(tiles)
+    for i, (tid, tile_dir) in enumerate(tiles, 1):
+        print(f"[{i}/{n}] healpix_{tid} ...", end="", file=sys.stderr, flush=True)
         reasons = []
         for label, path in (("prithvi", prithvi_dir / f"healpix_{tid}_float32.npz"),
                             ("presto", out_dir / f"healpix_{tid}_presto.npz")):
@@ -114,6 +119,8 @@ def main():
                     reasons.append(f"{label} CORRUPT ({err})")
         size = 0 if args.no_size else dir_size(tile_dir)
         (blocked if reasons else reclaimable).append((tid, tile_dir, size, reasons))
+        print(f" {'KEEP' if reasons else 'RECLAIMABLE'}"
+              f"{'' if args.no_size else ' (' + human(size) + ')'}", file=sys.stderr, flush=True)
 
     print(f"{'tile':>10}  {'size':>8}  status")
     print("-" * 72)
