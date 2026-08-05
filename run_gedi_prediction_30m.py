@@ -170,7 +170,17 @@ class GEDIPredictor30m:
         include_zeros is set so the zero-retaining caches are loaded instead of the
         default zero-filtered ones."""
         suffix = "_withzeros" if self.include_zeros else ""
-        return self.preprocessed_dir / f"healpix_{healpix_id}_{self.embedding_format}{suffix}.npz"
+        primary = (self.preprocessed_dir /
+                   f"healpix_{healpix_id}_{self.embedding_format}{suffix}.npz")
+        if primary.exists():
+            return primary
+        # Two naming conventions are in use: preprocess_olmo_to_gedi_tiles.py and
+        # tessera_processing.py name caches by dtype (healpix_<id>_float32.npz),
+        # while olmoearth_download.py names them by source (healpix_<id>_olmo.npz).
+        # Accept either so a cache dir does not have to be renamed to be usable.
+        alt = (self.preprocessed_dir /
+               f"healpix_{healpix_id}_{self.embedding_source}{suffix}.npz")
+        return alt if alt.exists() else primary
 
     def load_embeddings_tile(self, healpix_id):
         """
