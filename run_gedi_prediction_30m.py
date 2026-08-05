@@ -85,7 +85,7 @@ class GEDIPredictor30m:
                            zero-filtered .npz cache is loaded.
         """
         _VALID_MODELS = ('rf', 'xgb', 'gb', 'lr')
-        _VALID_SOURCES = ('olmo', 'aef')
+        _VALID_SOURCES = ('olmo', 'aef', 'tessera')
         if embedding_source not in _VALID_SOURCES:
             raise ValueError(f"embedding_source must be one of {_VALID_SOURCES}")
         if model_type not in _VALID_MODELS:
@@ -892,7 +892,7 @@ def main():
                         help='Output directory for models and results')
     parser.add_argument('--embedding-format', choices=['float32', 'int8'], default='float32',
                         help='Embedding format to load (default: float32)')
-    parser.add_argument('--embedding-source', choices=['olmo', 'aef'], default='olmo',
+    parser.add_argument('--embedding-source', choices=['olmo', 'aef', 'tessera'], default='olmo',
                         help='Embedding source: olmo or aef (default: olmo). '
                              'Used for output naming and metadata. When --year is provided '
                              'and --preprocessed-dir is omitted, auto-constructs path as '
