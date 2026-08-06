@@ -55,6 +55,57 @@ def tile_valid(gedi_path, include_zeros):
     return rows, cols, (g[rows, cols] / 100.0).astype(np.float32), profile
 
 
+def align_tile(y_full, yt, offset, atol=1e-2, n_expected=None):
+    """Order-preserving alignment of a tile's parquet rows onto its GEDI pixels.
+
+    Some pipelines drop GEDI samples that fall on uncovered embedding pixels --
+    tessera_processing.py does this for all-zero (no TESSERA coverage) rows. The kept
+    rows are a boolean mask of the np.where() order, so ORDER IS PRESERVED and the
+    surviving pixels can be recovered by walking the tile's full y sequence and
+    consuming a parquet row whenever the values agree.
+
+    Returns (keep_idx, n_ties). `keep_idx` indexes into the tile's full (rows, cols).
+    `n_ties` counts matches whose neighbour has the same height, i.e. places where the
+    alignment could equally have chosen the adjacent pixel: the VALUE is right either
+    way, the pixel may be off by one position. Reported so the ambiguity is visible.
+    """
+    keep, ties = [], 0
+    i, j = 0, offset
+    while i < len(y_full) and j < len(yt):
+        if abs(float(y_full[i]) - float(yt[j])) <= atol:
+            keep.append(i)
+            if i + 1 < len(y_full) and abs(float(y_full[i + 1]) - float(y_full[i])) <= atol:
+                ties += 1
+            j += 1
+        i += 1
+    if n_expected is not None and len(keep) != n_expected:
+        return None, ties
+    return np.asarray(keep, dtype=np.int64), ties
+
+
+def cache_counts(cache_dir, tile_ids, model_name):
+    """Per-tile row counts read from the embedding caches, if available.
+
+    Pins the tile boundaries exactly, so alignment cannot over-consume across a tile
+    edge when the last height of one tile equals the first of the next.
+    """
+    if not cache_dir:
+        return {}
+    d = Path(cache_dir)
+    counts = {}
+    for hid in tile_ids:
+        for name in (f"healpix_{hid}_float32.npz", f"healpix_{hid}_{model_name}.npz"):
+            p = d / name
+            if p.exists():
+                try:
+                    with np.load(p) as z:
+                        counts[hid] = int(z["y"].shape[0])
+                except Exception:
+                    pass
+                break
+    return counts
+
+
 def find_gedi_dirs(gedi_base, years):
     out = {}
     for y in years:
@@ -78,6 +129,15 @@ def main():
     ap.add_argument("--model-name", required=True,
                     help="Used in output filename healpix_<id>_<model>.tif")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--align", action="store_true",
+                    help="Allow per-tile subsequence alignment when the cache dropped "
+                         "GEDI samples on uncovered embedding pixels (tessera does "
+                         "this). Slower and slightly ambiguous where adjacent pixels "
+                         "share a height; only used if the exact matchers fail.")
+    ap.add_argument("--cache-dir", default=None,
+                    help="Embedding cache dir (healpix_<id>_float32.npz). With --align, "
+                         "pins each tile's row count exactly so the alignment cannot "
+                         "run past a tile boundary.")
     ap.add_argument("--tile", type=int, default=None,
                     help="Only write this healpix id (still auto-detects year on full split)")
     args = ap.parse_args()
@@ -96,33 +156,112 @@ def main():
         raise SystemExit(f"No gedi_tiles_<year>_healpix dirs under {args.gedi_base}")
 
     # --- auto-detect (year, include_zeros) by matching y_true exactly ---
+    #
+    # Two passes. STRICT expects every split tile to be present, which is the case
+    # when the run had a cache for all of them. If a run skipped tiles (a missing
+    # embedding cache -> see missing_tiles.json in the run dir), the totals cannot
+    # line up, so SUBSET walks the tiles in shapefile order and consumes a tile only
+    # when its y block matches the next rows of the parquet; a tile that does not
+    # match was skipped by the run. Order is preserved either way, which is what
+    # makes the retrace valid.
+    def strict(iz, gd):
+        ys, per_tile = [], {}
+        for hid in tile_ids:
+            p = gd / f"healpix_{hid}_gedi.tif"
+            if not p.exists():
+                continue
+            _, _, y, _ = tile_valid(p, iz)
+            if len(y) == 0:
+                continue
+            per_tile[hid] = len(y)
+            ys.append(y)
+        yfull = np.concatenate(ys) if ys else np.array([], np.float32)
+        if len(yfull) == len(yt) and np.allclose(yfull, yt, atol=1e-2):
+            return per_tile, []
+        return None, None
+
+    def subset(iz, gd):
+        per_tile, skipped, offset = {}, [], 0
+        for hid in tile_ids:
+            p = gd / f"healpix_{hid}_gedi.tif"
+            if not p.exists():
+                continue
+            _, _, y, _ = tile_valid(p, iz)
+            n = len(y)
+            if n == 0:
+                continue
+            if offset + n <= len(yt) and np.allclose(yt[offset:offset + n], y, atol=1e-2):
+                per_tile[hid] = n
+                offset += n
+            else:
+                skipped.append(hid)
+        if offset == len(yt) and per_tile:
+            return per_tile, skipped
+        return None, None
+
+    def aligned(iz, gd):
+        """Per-tile subsequence alignment, for caches that dropped uncovered pixels."""
+        counts = cache_counts(args.cache_dir, tile_ids, args.model_name)
+        per_tile, keep_map, offset, total_ties = {}, {}, 0, 0
+        for hid in tile_ids:
+            p = gd / f"healpix_{hid}_gedi.tif"
+            if not p.exists():
+                continue
+            _, _, y_full, _ = tile_valid(p, iz)
+            if len(y_full) == 0:
+                continue
+            if counts and hid not in counts:
+                # A cache dir was supplied and this tile has no cache: the run never
+                # saw it, so it contributes NO parquet rows. Aligning it anyway lets
+                # the greedy match steal rows from the next tile and silently shifts
+                # everything downstream.
+                continue
+            keep, ties = align_tile(y_full, yt, offset, n_expected=counts.get(hid))
+            if keep is None or len(keep) == 0:
+                continue
+            per_tile[hid] = len(keep)
+            keep_map[hid] = keep
+            offset += len(keep)
+            total_ties += ties
+        if offset == len(yt) and per_tile:
+            aligned.keep_map = keep_map
+            aligned.ties = total_ties
+            return per_tile, []
+        return None, None
+
+    finders = (strict, subset, aligned) if args.align else (strict, subset)
     match = None
-    for iz in (False, True):
-        for year, gd in gedi_dirs.items():
-            ys, per_tile = [], {}
-            for hid in tile_ids:
-                p = gd / f"healpix_{hid}_gedi.tif"
-                if not p.exists():
-                    continue
-                _, _, y, _ = tile_valid(p, iz)
-                if len(y) == 0:
-                    continue
-                per_tile[hid] = len(y)
-                ys.append(y)
-            yfull = np.concatenate(ys) if ys else np.array([], np.float32)
-            if len(yfull) == len(yt) and np.allclose(yfull, yt, atol=1e-2):
-                match = (year, iz, gd, per_tile)
+    for finder in finders:
+        for iz in (False, True):
+            for year, gd in gedi_dirs.items():
+                per_tile, skipped = finder(iz, gd)
+                if per_tile is not None:
+                    match = (year, iz, gd, per_tile, skipped, finder.__name__)
+                    break
+            if match:
                 break
         if match:
             break
 
     if not match:
         raise SystemExit(
-            "Could not match parquet y_true to any (year, include_zeros). "
-            "Check --years / --shapefile / --split (the run may have skipped "
-            "tiles or used a different shapefile order).")
-    year, include_zeros, gd, per_tile = match
-    print(f"MATCH: GEDI year={year}  include_zeros={include_zeros}  dir={gd}")
+            "Could not match parquet y_true to any (year, include_zeros). If this "
+            "cache drops GEDI samples on uncovered embedding pixels (tessera does), "
+            "re-run with --align (and --cache-dir for an exact per-tile row count). "
+            "Otherwise check --years / --shapefile / --split, and that the GEDI "
+            "rasters are the ones the run actually used.")
+    year, include_zeros, gd, per_tile, skipped, how = match
+    print(f"MATCH ({how}): GEDI year={year}  include_zeros={include_zeros}  dir={gd}")
+    print(f"  {len(per_tile)} tile(s) matched, {sum(per_tile.values()):,} rows")
+    if skipped:
+        print(f"  {len(skipped)} tile(s) absent from the parquet (skipped by the run): "
+              f"{', '.join(str(h) for h in skipped)}")
+    if how == "aligned":
+        ties = getattr(aligned, "ties", 0)
+        print(f"  ALIGNED mode: pixel positions recovered by subsequence matching. "
+              f"{ties:,} tie(s) where a neighbouring pixel shares the same height "
+              f"({100 * ties / max(1, len(yt)):.2f}% — value correct, position may be "
+              f"off by one).")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +280,9 @@ def main():
 
         rows, cols, y_recompute, profile = tile_valid(
             gd / f"healpix_{hid}_gedi.tif", include_zeros)
+        keep = getattr(aligned, "keep_map", {}).get(hid) if how == "aligned" else None
+        if keep is not None:
+            rows, cols, y_recompute = rows[keep], cols[keep], y_recompute[keep]
         assert len(rows) == n, f"tile {hid}: {len(rows)} != {n}"
         if not np.allclose(y_recompute, yt[sl], atol=1e-2):
             raise SystemExit(f"tile {hid}: y_true mismatch — reconstruction unsafe")
