@@ -110,6 +110,13 @@ def main() -> None:
 
     count = src.count(TARGET)
     if count != 1:
+        if "safely_reproject_within_valid_area" not in src:
+            # Older rslearn reprojects items with a plain to_projection() call and
+            # never clips against a buffered region, so the GEOS TopologyException
+            # this patch guards against cannot arise. Nothing to do.
+            print("this rslearn has no safely_reproject_within_valid_area() -- it "
+                  "predates the affected code path, so NO PATCH IS NEEDED.")
+            return
         sys.exit(f"expected exactly 1 occurrence of the clip line, found {count}. "
                  f"rslearn has changed -- re-derive the patch from:\n"
                  f"  python -c \"import inspect; from rslearn.utils import geometry; "

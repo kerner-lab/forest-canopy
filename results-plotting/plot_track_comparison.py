@@ -41,19 +41,42 @@ from sklearn.cluster import DBSCAN
 GEDI_NODATA = -9999.0
 GEDI_MAX_CM = 12000
 
-# Default models to overlay: (label, raster path template, colour, nodata).
-# {gid} is filled with the healpix id. Extend this list to add more models once
-# their per-tile prediction rasters (on the GEDI grid) exist.
+DEFAULT_PRED_ROOT = "/Users/kdoerkse/Documents/ASU/JPL/data"
+
+# Default panels, TOP to BOTTOM. Each entry is
+#   (label, raster path template, colour, nodata)
+# and the template may use {root} (--pred-root), {year} and {gid}.
+#
+# Panel order is the list order, so the learned encoders come first and the
+# Potapov baseline is last -- it is the reference every encoder is being judged
+# against, and putting it at the foot of the stack is the convention in the
+# ALS-transect figures this is modelled on. Models whose raster is missing are
+# dropped from the figure but reported at the end, so a silently absent model
+# cannot be mistaken for one that simply performed badly.
+#
+# The bracketed resolution is the encoder's NATIVE support, not the prediction
+# grid -- every raster here is already on the GEDI grid. Worth keeping visible,
+# since spatial support differs by ~50x across these encoders.
 DEFAULT_MODELS = [
+    ("OlmoEarth RF (40m)",
+     "{root}/olmo_pred_rasters/{year}/healpix_{gid}_olmo.tif",
+     "#d1495b", -9999.0),
     ("AlphaEarth RF (10m)",
-     "/Users/kdoerkse/Documents/ASU/JPL/data/aef_pred_rasters/healpix_{gid}_aef.tif",
+     "{root}/aef_pred_rasters/healpix_{gid}_aef.tif",
      "#7b3fb0", -9999.0),
+    ("TESSERA RF (10m)",
+     "{root}/tessera_pred_rasters/{year}/healpix_{gid}_tessera.tif",
+     "#1f6fb4", -9999.0),
+    ("Presto RF (10m)",
+     "{root}/presto_pred_rasters/{year}/healpix_{gid}_presto.tif",
+     "#e08214", -9999.0),
+    ("Prithvi RF (30m)",
+     "{root}/prithvi_pred_rasters/{year}/healpix_{gid}_prithvi.tif",
+     "#2a9d8f", -9999.0),
+    # Baseline last => bottom panel.
     ("Potapov (30m)",
-     "/Users/kdoerkse/Documents/ASU/JPL/data/potapov_baseline_2019/potapov_tiles/healpix_{gid}_potapov.tif",
-     "#3b6fb0", 0.0),
-    ("Lang / ETH (10m)",
-     "/Users/kdoerkse/Documents/ASU/JPL/data/eth_canopy_baseline_2020/eth_tiles/healpix_{gid}_eth.tif",
-     "#3a9188", -9999.0),
+     "{root}/potapov_baseline_{year}/potapov_tiles/healpix_{gid}_potapov.tif",
+     "#6c757d", 0.0),
 ]
 
 
@@ -139,6 +162,13 @@ def main():
                          "'AlphaEarth (2019)|/data/aef_pred_rasters/healpix_{gid}_aef2019.tif|#7b3fb0|-9999'")
     ap.add_argument("--max-length-m", type=float, default=None,
                     help="Crop the transect to the first N metres (for a tighter figure)")
+    ap.add_argument("--pred-root", default=DEFAULT_PRED_ROOT,
+                    help="Base dir filled into {root} in the default path templates "
+                         "(default: %(default)s)")
+    ap.add_argument("--panel-metrics", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Annotate each panel with along-track RMSE and bias "
+                         "vs GEDI (default: on)")
     args = ap.parse_args()
 
     gid = args.healpix_id
@@ -190,11 +220,12 @@ def main():
         models = DEFAULT_MODELS
 
     # Sample each model raster at the track pixels.
-    model_series = []
+    model_series, missing = [], []
     for label, tmpl, color, mnod in models:
-        p = tmpl.format(gid=gid)
+        p = tmpl.format(gid=gid, year=args.year, root=args.pred_root)
         if not Path(p).exists():
             print(f"  skip {label}: raster not found ({p})")
+            missing.append(label)
             continue
         arr, rnod = load_raster_on_gedi_grid(p, ref_shape)
         vals = arr[trk_rows, trk_cols]
@@ -203,15 +234,27 @@ def main():
             if nd is not None:
                 mask &= (vals != nd)
         y = np.where(mask, vals, np.nan)
-        model_series.append((label, color, y, int(mask.sum())))
-        print(f"  {label}: {int(mask.sum())}/{len(vals)} valid predictions on track")
+        # Per-panel skill against GEDI on THIS track only -- indicative, not the
+        # paper's headline metric (that comes from the full test split).
+        if mask.any():
+            d = y[mask] - gedi_m[mask]
+            rmse = float(np.sqrt(np.mean(d ** 2)))
+            bias = float(np.mean(d))
+        else:
+            rmse = bias = float("nan")
+        model_series.append((label, color, y, int(mask.sum()), rmse, bias))
+        print(f"  {label}: {int(mask.sum())}/{len(vals)} valid on track  "
+              f"RMSE={rmse:.2f} m  bias={bias:+.2f} m")
 
     if not model_series:
         raise SystemExit("No model rasters available to plot.")
+    if missing:
+        print(f"\nWARNING: {len(missing)} model(s) absent from the figure: "
+              f"{', '.join(missing)}")
 
     out = Path(args.out) if args.out else Path(f"track_comparison_{gid}.png")
     ymax = np.nanmax([gedi_m.max()] +
-                     [np.nanmax(y) for _, _, y, n in model_series if n]) * 1.1
+                     [np.nanmax(y) for _, _, y, n, _, _ in model_series if n]) * 1.1
 
     n_panels = len(model_series)
     fig, axes = plt.subplots(n_panels, 1, figsize=(10, 2.1 * n_panels + 0.5),
@@ -219,7 +262,7 @@ def main():
     if n_panels == 1:
         axes = [axes]
 
-    for ax, (label, color, y, n) in zip(axes, model_series):
+    for ax, (label, color, y, n, rmse, bias) in zip(axes, model_series):
         # GEDI ground truth: light shading + black line, repeated in each panel.
         ax.fill_between(t, 0, gedi_m, color="0.75", alpha=0.6, linewidth=0, zorder=1)
         ax.plot(t, gedi_m, color="black", linewidth=1.2, zorder=2,
@@ -231,6 +274,12 @@ def main():
         ax.text(0.015, 0.90, label, transform=ax.transAxes, ha="left", va="top",
                 color=color, fontsize=12, fontweight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+        if args.panel_metrics and n:
+            ax.text(0.985, 0.90, f"RMSE {rmse:.1f} m   bias {bias:+.1f} m",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=9, color="0.25",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none",
+                              alpha=0.7))
         ax.set_ylabel("Height (m)")
         ax.grid(True, alpha=0.25)
 

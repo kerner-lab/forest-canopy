@@ -24,8 +24,32 @@ BINS = [
 ]
 
 
+def _resolve_parquet(parquet_file, prefer='test'):
+    """Accept either a predictions parquet or the run's output directory.
+
+    pandas treats a directory as a PARTITIONED parquet dataset and tries to read
+    every file in it, so passing an output dir fails on the first .png with
+    "Parquet magic bytes not found". Resolve a directory to the parquet inside it
+    instead, preferring the test split.
+    """
+    if not os.path.isdir(parquet_file):
+        return parquet_file
+
+    candidates = sorted(f for f in os.listdir(parquet_file)
+                        if f.startswith('predictions_') and f.endswith('.parquet'))
+    if not candidates:
+        sys.exit(f"No predictions_*.parquet in {parquet_file}")
+    chosen = next((f for f in candidates if f == f'predictions_{prefer}.parquet'),
+                  candidates[0])
+    if len(candidates) > 1:
+        print(f"{parquet_file} contains {len(candidates)} parquet(s): "
+              f"{', '.join(candidates)}")
+    print(f"Using {chosen}")
+    return os.path.join(parquet_file, chosen)
+
+
 def _load_from_parquet(parquet_file):
-    df = pd.read_parquet(parquet_file)
+    df = pd.read_parquet(_resolve_parquet(parquet_file))
     gedi_arr = df['y_true'].values.astype(np.float64)
     pred_arr = df['y_pred'].values.astype(np.float64)
     return pred_arr, gedi_arr
@@ -219,6 +243,12 @@ if __name__ == '__main__':
     if args.parquet is None and any(
             v is None for v in [args.preds_dir, args.gedi_dir, args.data_file]):
         parser.error('preds_dir, gedi_dir, and data_file are required unless --parquet is provided')
+
+    if args.parquet is not None:
+        # Resolve here (not lazily inside the loader) so the default figure path is
+        # derived from the actual parquet -- otherwise passing a run DIRECTORY puts
+        # the plot next to the directory instead of inside it.
+        args.parquet = _resolve_parquet(args.parquet)
 
     if args.out_plot is None:
         if args.parquet is not None:
