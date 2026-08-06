@@ -91,8 +91,18 @@ def main() -> None:
     src = path.read_text()
     applied = MARKER in src
 
+    # Three states, not two: an rslearn old enough to lack the clipping helper has
+    # nothing to patch, and reporting that as "unpatched" reads as a problem.
+    not_applicable = "safely_reproject_within_valid_area" not in src
+    if applied:
+        status = "PATCHED"
+    elif not_applicable:
+        status = "not applicable (no safely_reproject_within_valid_area in this rslearn)"
+    else:
+        status = "unpatched"
+
     print(f"file    : {path}")
-    print(f"status  : {'PATCHED' if applied else 'unpatched'}")
+    print(f"status  : {status}")
 
     if args.check:
         return
