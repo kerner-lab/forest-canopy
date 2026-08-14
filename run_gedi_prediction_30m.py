@@ -52,7 +52,9 @@ class GEDIPredictor30m:
                  subset_fraction=None, subset_seed=42, subset_splits=None,
                  stratified_sample_fraction=None, stratified_sample_seed=42,
                  stratified_splits=None, model_type='rf', embedding_source='olmo',
-                 include_zeros=False, tile_allowlist=None):
+                 include_zeros=False, tile_allowlist=None,
+                 metric_bin_size=10.0, metric_max_height=60.0,
+                 metric_min_bin_n=100, metric_balance_seed=42):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -116,6 +118,12 @@ class GEDIPredictor30m:
         # across embedding sources so their metrics are comparable — without it a
         # source with fewer cached tiles is silently scored on a different dataset.
         self.tile_allowlist = set(int(t) for t in tile_allowlist) if tile_allowlist else None
+        # Height-binned ("stratified") reporting. Bins are [0, bin_size, ..., max];
+        # everything above max_height falls in the top bin.
+        self.metric_bin_size = metric_bin_size
+        self.metric_max_height = metric_max_height
+        self.metric_min_bin_n = metric_min_bin_n
+        self.metric_balance_seed = metric_balance_seed
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
@@ -549,10 +557,113 @@ class GEDIPredictor30m:
             'r2': float(r2_score(y_train, y_pred)),
             'n_samples': int(len(y_train)),
         }
+        metrics['stratified'] = self._stratified_metrics(y_train, y_pred)
         print(f"Train  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}")
+        self._report_stratified(metrics, 'train')
         self.logger.info(f"Train metrics: {metrics}")
         self._save_predictions(y_train, y_pred, 'train')
         return {'train': metrics}
+
+    def _stratified_metrics(self, y_true, y_pred):
+        """Height-binned metrics, plus two ways of summarising them.
+
+        GEDI height distributions are heavily skewed toward short/mid canopy, so the
+        overall (micro) RMSE is dominated by whichever bin holds the most pixels and
+        says little about tall-canopy performance. Two stratified summaries are
+        returned, and they answer different questions:
+
+        macro_*   unweighted mean of the per-bin metrics. Every height class counts
+                  equally regardless of how rare it is. macro_rmse is the honest
+                  "how does this model do across the whole height range" number.
+
+        balanced_*  metrics recomputed on a bin-balanced subsample (every bin cut to
+                  the smallest bin's count). Preserves the ACROSS-bin variance, so
+                  balanced_r2 is meaningful in a way macro_r2 is not — see below.
+
+        CAVEAT on per-bin R^2: within a single 10 m bin the true heights barely vary,
+        so the denominator of R^2 (the within-bin variance of y) is tiny by
+        construction. Per-bin R^2 therefore collapses toward 0 or goes negative even
+        for a good model. This is range restriction, not a model failure. Report
+        per-bin RMSE and balanced_r2; do not headline macro_r2.
+        """
+        bin_size = self.metric_bin_size
+        edges = np.arange(0.0, self.metric_max_height + bin_size, bin_size)
+        idx = np.clip(np.digitize(y_true, edges) - 1, 0, len(edges) - 2)
+
+        bins, rmses, maes, r2s = [], [], [], []
+        for b in range(len(edges) - 1):
+            m = idx == b
+            n = int(m.sum())
+            lo, hi = float(edges[b]), float(edges[b + 1])
+            if n < self.metric_min_bin_n:
+                bins.append({'lo': lo, 'hi': hi, 'n': n, 'rmse': None,
+                             'mae': None, 'r2': None})
+                continue
+            yt, yp = y_true[m], y_pred[m]
+            rmse = float(np.sqrt(mean_squared_error(yt, yp)))
+            mae = float(mean_absolute_error(yt, yp))
+            # Undefined when every true value in the bin is identical.
+            r2 = float(r2_score(yt, yp)) if np.ptp(yt) > 0 else None
+            bins.append({'lo': lo, 'hi': hi, 'n': n, 'rmse': rmse,
+                         'mae': mae, 'r2': r2, 'bias': float(np.mean(yp - yt))})
+            rmses.append(rmse)
+            maes.append(mae)
+            if r2 is not None:
+                r2s.append(r2)
+
+        out = {
+            'bin_size': bin_size,
+            'bins': bins,
+            'n_bins_used': len(rmses),
+            'macro_rmse': float(np.mean(rmses)) if rmses else None,
+            'macro_mae': float(np.mean(maes)) if maes else None,
+            'macro_r2': float(np.mean(r2s)) if r2s else None,
+        }
+
+        # Bin-balanced resample: equalise bin counts, then compute ordinary metrics.
+        # Seeded off the model seed so the sweep's seed-to-seed spread includes this.
+        counts = [b['n'] for b in bins if b['n'] >= self.metric_min_bin_n]
+        if len(counts) >= 2:
+            k = min(counts)
+            rng = np.random.default_rng(self.metric_balance_seed)
+            take = []
+            for b in range(len(edges) - 1):
+                pos = np.flatnonzero(idx == b)
+                if len(pos) >= self.metric_min_bin_n:
+                    take.append(rng.choice(pos, size=k, replace=False))
+            sel = np.concatenate(take)
+            yt, yp = y_true[sel], y_pred[sel]
+            out.update({
+                'balanced_n_per_bin': int(k),
+                'balanced_n_samples': int(len(sel)),
+                'balanced_rmse': float(np.sqrt(mean_squared_error(yt, yp))),
+                'balanced_mae': float(mean_absolute_error(yt, yp)),
+                'balanced_r2': float(r2_score(yt, yp)),
+            })
+        return out
+
+    def _report_stratified(self, metrics, split_name):
+        """Print the per-bin table and attach the summaries to `metrics`."""
+        s = metrics['stratified']
+        print(f"  {split_name} stratified ({s['bin_size']:.0f} m bins):")
+        print(f"    {'bin (m)':>12} {'n':>10} {'RMSE':>8} {'MAE':>8} {'R2':>8} {'bias':>8}")
+        for b in s['bins']:
+            if b['rmse'] is None:
+                print(f"    {b['lo']:5.0f}-{b['hi']:<6.0f} {b['n']:>10,}   (too few)")
+                continue
+            r2 = f"{b['r2']:8.3f}" if b['r2'] is not None else f"{'n/a':>8}"
+            print(f"    {b['lo']:5.0f}-{b['hi']:<6.0f} {b['n']:>10,} {b['rmse']:8.3f} "
+                  f"{b['mae']:8.3f} {r2} {b['bias']:8.3f}")
+        macro = s['macro_rmse']
+        bal = s.get('balanced_rmse')
+        print(f"    macro RMSE={macro:.3f}" if macro is not None else "    macro RMSE=n/a", end="")
+        if bal is not None:
+            print(f"   balanced RMSE={bal:.3f}  balanced R2={s['balanced_r2']:.3f}"
+                  f"  (n={s['balanced_n_per_bin']:,}/bin)")
+        else:
+            print()
+        self.logger.info(f"'{split_name}' stratified: macro_rmse={macro} "
+                         f"balanced_rmse={bal} balanced_r2={s.get('balanced_r2')}")
 
     def _predict(self, X):
         """Predict canopy heights; maps LR class indices to bin-centre heights."""
@@ -577,7 +688,9 @@ class GEDIPredictor30m:
             'r2': float(r2_score(y, y_pred)),
             'n_samples': int(len(y)),
         }
+        metrics['stratified'] = self._stratified_metrics(y, y_pred)
         print(f"{split_name.capitalize()}  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}")
+        self._report_stratified(metrics, split_name)
         self.logger.info(f"'{split_name}' metrics: {metrics}")
 
         self._save_predictions(y, y_pred, split_name)
@@ -985,6 +1098,14 @@ def main():
     parser.add_argument('--stratified-splits', nargs='+', default=['train'],
                         metavar='SPLIT',
                         help='Which splits to apply stratified sampling to (default: train)')
+    parser.add_argument('--metric-bin-size', type=float, default=10.0,
+                        help='Height bin width in m for stratified metrics (default: 10)')
+    parser.add_argument('--metric-max-height', type=float, default=60.0,
+                        help='Top bin edge in m; taller pixels fall in the last bin '
+                             '(default: 60)')
+    parser.add_argument('--metric-min-bin-n', type=int, default=100,
+                        help='Bins with fewer pixels than this are reported but excluded '
+                             'from the macro/balanced summaries (default: 100)')
     parser.add_argument('--tile-list', default=None, metavar='PATH',
                         help='File of healpix ids (one per line) restricting EVERY split. '
                              'Use the master list from build_master_tile_list.py so all '
@@ -1034,6 +1155,12 @@ def main():
         embedding_source=args.embedding_source,
         include_zeros=args.include_zeros,
         tile_allowlist=tile_allowlist,
+        metric_bin_size=args.metric_bin_size,
+        metric_max_height=args.metric_max_height,
+        metric_min_bin_n=args.metric_min_bin_n,
+        # Tie the balancing resample to the model seed so its contribution shows up
+        # in the seed-to-seed spread rather than being silently held fixed.
+        metric_balance_seed=args.random_state,
     )
 
     train_metrics = predictor.train(
