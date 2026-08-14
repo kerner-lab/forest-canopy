@@ -157,6 +157,24 @@ def figure_density(results, args, out_path):
         ax.plot([0, hi], [0, hi], color=INK_MUTED, linewidth=1.5,
                 linestyle=(0, (5, 4)), zorder=3)
 
+        # Per-bin least-squares fit, drawn as one segment per height bin and
+        # deliberately NOT joined between bins — the breaks show where the
+        # relationship changes. No markers: the segments are the message.
+        if args.fit_bins:
+            edges = np.arange(0.0, args.max_height + args.bin_size, args.bin_size)
+            edges = np.append(edges, max(hi, float(yt.max())))
+            for lo, up in zip(edges[:-1], edges[1:]):
+                m = (yt >= lo) & (yt < up)
+                # NB: not `n` — that name holds the panel count used below to
+                # hide the unused axes in a partly-filled grid.
+                n_in_bin = int(m.sum())
+                if n_in_bin < args.min_bin_n or np.ptp(yt[m]) <= 0:
+                    continue
+                slope, intercept = np.polyfit(yt[m], yp[m], 1)
+                xs = np.array([lo, min(up, hi)])
+                ax.plot(xs, slope * xs + intercept, color=INK,
+                        linewidth=2.0, solid_capstyle="round", zorder=4)
+
         # No metrics annotation inside the axes — the numbers belong in the table
         # from aggregate_seed_sweep.py, not printed over the data.
         ax.set_title(LABELS.get(src, src), color=INK, fontsize=12,
@@ -192,6 +210,8 @@ def figure_density(results, args, out_path):
                  color=INK, fontsize=14, fontweight="600", x=0.02, ha="left",
                  y=1.005)
     note = "Dashed line 1:1."
+    if args.fit_bins:
+        note += f" Solid segments: least-squares fit within each {args.bin_size:.0f} m bin."
     if args.style == "scatter" and args.max_points:
         note += f" Up to {args.max_points:,} points per panel."
     fig.text(0.02, -0.01,
@@ -257,6 +277,9 @@ def main():
     ap.add_argument("--bin-size", type=float, default=10.0)
     ap.add_argument("--max-height", type=float, default=60.0)
     ap.add_argument("--min-bin-n", type=int, default=100)
+    ap.add_argument("--fit-bins", action=argparse.BooleanOptionalAction, default=True,
+                    help="draw a per-bin least-squares fit segment in each panel "
+                         "(--no-fit-bins to omit)")
     ap.add_argument("--style", default="scatter", choices=["scatter", "hexbin"],
                     help="panel style: plain scatter (default, matches the existing "
                          "prediction plots) or a 2-D density hexbin")
