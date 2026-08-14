@@ -110,6 +110,20 @@ def per_bin_series(y_true, y_pred, bin_size, max_height, min_bin_n):
     return c, rmse, bias, s
 
 
+def point_density(x, y, hi, nbins):
+    """Local point count for each (x, y), from a 2-D histogram lookup.
+
+    A KDE is O(n^2)-ish and hopeless at these row counts; binning the plane and
+    reading each point's own cell is O(n) and gives the same "how many points are
+    here" read, which is all the colour needs to convey.
+    """
+    edges = np.linspace(0, hi, nbins + 1)
+    H, _, _ = np.histogram2d(x, y, bins=[edges, edges])
+    ix = np.clip(np.digitize(x, edges) - 1, 0, nbins - 1)
+    iy = np.clip(np.digitize(y, edges) - 1, 0, nbins - 1)
+    return H[ix, iy]
+
+
 def style_axes(ax):
     ax.set_facecolor("white")
     ax.grid(True, color=GRID, linewidth=0.8, zorder=0)
@@ -132,7 +146,26 @@ def figure_density(results, args, out_path):
     hi = args.max_height + args.bin_size
 
     hb = None
+    mappable = None
     rng = np.random.default_rng(0)
+
+    # Pre-pass: subsample once and find the global max density, so the colour
+    # scale means the same count in every panel. Without this a sparse model
+    # would look as dense as a well-populated one.
+    panel_pts, dens_max = {}, 1.0
+    if args.style == "scatter":
+        for src, r in results:
+            yt = r["df"]["y_true"].to_numpy()
+            yp = r["df"]["y_pred"].to_numpy()
+            if args.max_points and len(yt) > args.max_points:
+                sel = rng.choice(len(yt), size=args.max_points, replace=False)
+                yt, yp = yt[sel], yp[sel]
+            panel_pts[src] = (yt, yp)
+            if args.density_cmap != "none":
+                dens_max = max(dens_max,
+                               float(point_density(yt, yp, hi,
+                                                   args.density_bins).max()))
+
     for ax, (src, r) in zip(axes.ravel(), results):
         style_axes(ax)
         yt, yp = r["df"]["y_true"].to_numpy(), r["df"]["y_pred"].to_numpy()
@@ -142,16 +175,31 @@ def figure_density(results, args, out_path):
                            cmap=DENSITY_CMAP, norm=LogNorm(vmin=1), mincnt=1,
                            linewidths=0, zorder=1)
         else:
-            # Plain scatter, matching the convention in _plot_predictions().
-            # Subsampled so a multi-million-row split stays renderable; the same
-            # seed is used for every panel so the point budget is comparable.
-            if args.max_points and len(yt) > args.max_points:
-                sel = rng.choice(len(yt), size=args.max_points, replace=False)
-                sy, sp = yt[sel], yp[sel]
+            sy, sp = panel_pts[src]
+            if args.density_cmap == "none":
+                ax.scatter(sy, sp, s=args.point_size, alpha=args.point_alpha,
+                           color=SERIES[0], linewidths=0, zorder=1,
+                           rasterized=True)
             else:
-                sy, sp = yt, yp
-            ax.scatter(sy, sp, s=args.point_size, alpha=args.point_alpha,
-                       color=SERIES[0], linewidths=0, zorder=1, rasterized=True)
+                # Colour each point by local point count, via a 2-D histogram
+                # lookup (fast for millions of rows, unlike a KDE). Shared vmin/
+                # vmax across panels so colour means the same count everywhere.
+                dens = point_density(sy, sp, hi, args.density_bins)
+                order = np.argsort(dens)          # dense points drawn on top
+                sc = ax.scatter(sy[order], sp[order], c=dens[order],
+                                s=args.point_size, cmap=args.density_cmap,
+                                norm=LogNorm(vmin=1, vmax=dens_max),
+                                linewidths=0, zorder=1, rasterized=True)
+                mappable = sc
+
+        # Bin cut-offs, so the per-bin segments and the binned table can be read
+        # off the same picture.
+        if args.bin_lines:
+            for e in np.arange(args.bin_size, args.max_height + args.bin_size,
+                               args.bin_size):
+                if e < hi:
+                    ax.axvline(e, color=INK_MUTED, linewidth=0.9,
+                               linestyle=(0, (1, 3)), zorder=2)
 
         # 1:1 reference, recessive so it does not read as a data series.
         ax.plot([0, hi], [0, hi], color=INK_MUTED, linewidth=1.5,
@@ -198,9 +246,12 @@ def figure_density(results, args, out_path):
                 axes[r_i][c_i].set_xlabel("GEDI height (m)", color=INK_2, fontsize=10)
                 break
 
-    if hb is not None:
-        cbar = fig.colorbar(hb, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
-        cbar.set_label("pixels per hexagon", color=INK_2, fontsize=9)
+    bar_src = hb if hb is not None else mappable
+    if bar_src is not None:
+        cbar = fig.colorbar(bar_src, ax=axes.ravel().tolist(),
+                            fraction=0.02, pad=0.02)
+        cbar.set_label("pixels per hexagon" if hb is not None
+                       else "pixels per cell", color=INK_2, fontsize=9)
         cbar.ax.tick_params(colors=INK_2, labelsize=8, length=0)
         cbar.outline.set_visible(False)
 
@@ -289,7 +340,17 @@ def main():
     ap.add_argument("--point-size", type=float, default=1.5,
                     help="scatter marker size (default: 1.5)")
     ap.add_argument("--point-alpha", type=float, default=0.25,
-                    help="scatter marker alpha (default: 0.25)")
+                    help="scatter marker alpha (only used when --density-cmap none)")
+    ap.add_argument("--density-cmap", default="turbo",
+                    choices=["turbo", "jet", "rainbow", "viridis", "magma", "none"],
+                    help="colour scatter points by local point count. 'turbo' "
+                         "(default) is the well-behaved rainbow; 'viridis' is "
+                         "perceptually uniform and greyscale/CVD-safe; 'none' "
+                         "gives flat single-colour points")
+    ap.add_argument("--density-bins", type=int, default=140,
+                    help="grid resolution for the density lookup (default: 140)")
+    ap.add_argument("--bin-lines", action=argparse.BooleanOptionalAction, default=True,
+                    help="dotted grey verticals at the height-bin cut-offs")
     ap.add_argument("--gridsize", type=int, default=70,
                     help="hexbin resolution (default: 70)")
     ap.add_argument("--no-save-parquet", action="store_true",
