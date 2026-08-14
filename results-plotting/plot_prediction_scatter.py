@@ -157,15 +157,10 @@ def figure_density(results, args, out_path):
         ax.plot([0, hi], [0, hi], color=INK_MUTED, linewidth=1.5,
                 linestyle=(0, (5, 4)), zorder=3)
 
-        m = r["overall"]
+        # No metrics annotation inside the axes — the numbers belong in the table
+        # from aggregate_seed_sweep.py, not printed over the data.
         ax.set_title(LABELS.get(src, src), color=INK, fontsize=12,
                      fontweight="600", loc="left", pad=8)
-        ax.text(0.03, 0.97,
-                f"seed-mean (n={r['n_seeds']} seeds)\n"
-                f"RMSE {m['rmse']:.2f} m   R² {m['r2']:.3f}\n"
-                f"macro RMSE {r['strat']['macro_rmse']:.2f} m",
-                transform=ax.transAxes, va="top", ha="left",
-                fontsize=8.5, color=INK_2, linespacing=1.5)
         ax.set_xlim(0, hi)
         ax.set_ylim(0, hi)
         ax.set_aspect("equal")
@@ -227,12 +222,6 @@ def figure_bins(results, args, out_path):
                  markersize=8, markerfacecolor=colour,
                  markeredgecolor="white", markeredgewidth=2.0,
                  label=label, zorder=3)
-        # Selective direct label: last finite point only, never every point.
-        ok = np.flatnonzero(np.isfinite(rmse))
-        if len(ok):
-            j = ok[-1]
-            ax1.annotate(label, (c[j], rmse[j]), textcoords="offset points",
-                         xytext=(8, 0), va="center", fontsize=9, color=INK_2)
 
     ax2.axhline(0, color=INK_MUTED, linewidth=1.5, linestyle=(0, (5, 4)), zorder=2)
     # Headroom so the 8px markers at the extremes are not clipped by the spines.
