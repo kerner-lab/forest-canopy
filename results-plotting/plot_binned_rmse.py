@@ -35,7 +35,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from metrics_stratified import stratified_metrics  # noqa: E402
+from metrics_stratified import stratified_metrics, t975  # noqa: E402
 
 # Categorical slots in fixed order, never cycled.
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
@@ -105,6 +105,10 @@ def main():
     ap.add_argument("--max-height", type=float, default=60.0,
                     help="last closed edge; above it becomes the >N bin")
     ap.add_argument("--min-bin-n", type=int, default=100)
+    ap.add_argument("--interval", default="ci95", choices=["ci95", "std"],
+                    help="error bars: 'ci95' (default) = two-sided 95%% CI of the "
+                         "mean over seeds, t(0.975, n-1)*s/sqrt(n); 'std' = sample "
+                         "standard deviation across seeds")
     args = ap.parse_args()
 
     roots = {}
@@ -142,12 +146,18 @@ def main():
                 continue
             lab, arr, n_seeds = got
             labels = labels or lab
-            data[(year, src)] = (np.nanmean(arr, axis=0),
-                                 np.nanstd(arr, axis=0, ddof=1) if n_seeds > 1
-                                 else np.zeros(arr.shape[1]),
-                                 n_seeds)
+            mean = np.nanmean(arr, axis=0)
+            if n_seeds > 1:
+                sd = np.nanstd(arr, axis=0, ddof=1)
+                # Interval on the MEAN, since the mean is what is reported.
+                # t(0.975, n-1), not 1.96 — at n=5 that is 2.776.
+                err = (sd if args.interval == "std"
+                       else t975(n_seeds - 1) * sd / np.sqrt(n_seeds))
+            else:
+                sd = err = np.zeros(arr.shape[1])
+            data[(year, src)] = (mean, err, sd, n_seeds)
             print(f"{year} {src:<10} {n_seeds} seeds  " +
-                  "  ".join(f"{l}={m:.2f}" for l, m in zip(lab, data[(year, src)][0])))
+                  "  ".join(f"{l}={m:.2f}" for l, m in zip(lab, mean)))
 
     if not data:
         raise SystemExit("Nothing to plot.")
@@ -168,8 +178,8 @@ def main():
         for i, src in enumerate(sources):
             if (year, src) not in data:
                 continue
-            mean, std, _n = data[(year, src)]
-            ax.errorbar(x + offsets[i], mean, yerr=std,
+            mean, err, _sd, _n = data[(year, src)]
+            ax.errorbar(x + offsets[i], mean, yerr=err,
                         color=SERIES[i % len(SERIES)],
                         marker=MARKERS[i % len(MARKERS)], markersize=7,
                         markeredgecolor="white", markeredgewidth=1.4,
@@ -182,7 +192,8 @@ def main():
                      loc="left", pad=8)
         ax.margins(y=0.10)
 
-    axes[0].set_ylabel("RMSE (m)", color=INK_2, fontsize=10)
+    lab_y = "RMSE (m)" if args.interval == "std" else "RMSE (m)"
+    axes[0].set_ylabel(lab_y, color=INK_2, fontsize=10)
     leg = axes[0].legend(frameon=False, fontsize=9, loc="upper left",
                          ncol=min(n_src, 2))
     for t in leg.get_texts():
@@ -197,11 +208,14 @@ def main():
     if args.csv:
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["year", "source", "n_seeds", "bin",
-                        "rmse_mean", "rmse_std"])
-            for (year, src), (mean, std, n) in data.items():
-                for lab, m, s in zip(labels, mean, std):
-                    w.writerow([year, src, n, lab, f"{m:.6f}", f"{s:.6f}"])
+            w.writerow(["year", "source", "n_seeds", "bin", "rmse_mean",
+                        "rmse_std", "rmse_ci95_halfwidth"])
+            for (year, src), (mean, err, sd, n) in data.items():
+                ci = (err if args.interval == "ci95"
+                      else t975(n - 1) * sd / np.sqrt(n) if n > 1 else sd)
+                for lab, m, sdv, c in zip(labels, mean, sd, ci):
+                    w.writerow([year, src, n, lab, f"{m:.6f}",
+                                f"{sdv:.6f}", f"{c:.6f}"])
         print(f"wrote {args.csv}")
 
 
