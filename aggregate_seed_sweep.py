@@ -20,6 +20,13 @@ from pathlib import Path
 
 METRICS = ("rmse", "mae", "r2")
 
+# Stratified summaries, read from metrics["<split>"]["stratified"].
+# macro_*    = unweighted mean over height bins (every height class counts equally)
+# balanced_* = ordinary metrics on a bin-balanced subsample
+# macro_r2 is deliberately NOT included: within-bin R^2 is range-restricted and
+# collapses toward 0 regardless of model quality. Use balanced_r2 instead.
+STRAT_METRICS = ("macro_rmse", "macro_mae", "balanced_rmse", "balanced_r2")
+
 
 def load_runs(root: Path):
     """{source: {seed: {split: {metric: value}}}} from the sweep tree."""
@@ -67,15 +74,17 @@ def main():
     for source in sorted(runs):
         per_seed = runs[source]
         cols = {}
-        for m in METRICS:
+        for m in METRICS + STRAT_METRICS:
             vals = []
             for seed in sorted(per_seed):
                 block = per_seed[seed].get(args.split) or {}
                 # train metrics are nested one level deeper in the saved json
                 if args.split == "train" and "train" in block:
                     block = block["train"]
-                if m in block:
-                    vals.append(float(block[m]))
+                # stratified summaries live under the "stratified" sub-dict
+                src = block.get("stratified") or {} if m in STRAT_METRICS else block
+                if src.get(m) is not None:
+                    vals.append(float(src[m]))
             cols[m] = summarize(vals)
             cols[f"n_{m}"] = len(vals)
         rows.append((source, len(per_seed), cols))
@@ -92,6 +101,28 @@ def main():
         print(f"{source:<10} {n_seeds:>3}  {cells[0]:>16} {cells[1]:>16} {cells[2]:>16}")
     print()
 
+    if any(cols[f"n_{m}"] for _s, _n, cols in rows for m in STRAT_METRICS):
+        print(f"{n_label}: STRATIFIED over height bins\n")
+        print(f"{'source':<10} {'n':>3}  {'macro RMSE':>16} {'macro MAE':>16} "
+              f"{'bal. RMSE':>16} {'bal. R2':>16}")
+        print("-" * 86)
+        for source, n_seeds, cols in rows:
+            cells = []
+            for m in STRAT_METRICS:
+                mean, std = cols[m]
+                cells.append("n/a" if cols[f"n_{m}"] == 0
+                             else f"{mean:.3f} +/- {std:.3f}")
+            print(f"{source:<10} {n_seeds:>3}  " + " ".join(f"{c:>16}" for c in cells))
+        print("\n  macro_*    = unweighted mean over height bins; every height class counts\n"
+              "               equally, so tall-canopy error is no longer drowned out by the\n"
+              "               short-canopy pixels that dominate the overall number.\n"
+              "  balanced_* = metrics on a bin-balanced subsample. Use balanced_r2, not the\n"
+              "               mean of per-bin R^2 — within a single bin the true heights\n"
+              "               barely vary, so per-bin R^2 is range-restricted and collapses\n"
+              "               toward 0 even for a good model.\n"
+              "  Expect macro RMSE > overall RMSE. That gap IS the result: it measures how\n"
+              "  much of the headline score comes from the most common height class.\n")
+
     incomplete = [(s, n) for s, n, _ in rows if n != rows[0][1]]
     if incomplete:
         print("NOTE: seed counts differ across sources — "
@@ -102,10 +133,11 @@ def main():
         with open(args.csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["source", "split", "n_seeds"]
-                       + [c for m in METRICS for c in (f"{m}_mean", f"{m}_std")])
+                       + [c for m in METRICS + STRAT_METRICS
+                          for c in (f"{m}_mean", f"{m}_std")])
             for source, n_seeds, cols in rows:
                 out = [source, args.split, n_seeds]
-                for m in METRICS:
+                for m in METRICS + STRAT_METRICS:
                     mean, std = cols[m]
                     out += [f"{mean:.6f}", f"{std:.6f}"]
                 w.writerow(out)
