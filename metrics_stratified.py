@@ -13,7 +13,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
 def stratified_metrics(y_true, y_pred, bin_size=10.0, max_height=60.0,
-                       min_bin_n=100, balance_seed=42):
+                       min_bin_n=100, balance_seed=42, overflow_bin=False):
     """Height-binned metrics, plus two ways of summarising them.
 
     GEDI height distributions are heavily skewed toward short/mid canopy, so the
@@ -34,8 +34,15 @@ def stratified_metrics(y_true, y_pred, bin_size=10.0, max_height=60.0,
     construction. Per-bin R^2 therefore collapses toward 0 or goes negative even
     for a good model. This is range restriction, not a model failure. Report
     per-bin RMSE and balanced_r2; do not headline macro_r2.
+
+    overflow_bin: by default everything above max_height is CLIPPED into the top
+    closed bin, so a bin labelled 50-60 silently also contains the 70 m pixels.
+    Set True to add a final open-ended bin [max_height, inf) instead, reported
+    with hi=inf and labelled ">60" — which is what you want for a per-bin plot.
     """
     edges = np.arange(0.0, max_height + bin_size, bin_size)
+    if overflow_bin:
+        edges = np.append(edges, np.inf)
     idx = np.clip(np.digitize(y_true, edges) - 1, 0, len(edges) - 2)
 
     bins, rmses, maes, r2s = [], [], [], []
