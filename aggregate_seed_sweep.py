@@ -16,7 +16,11 @@ import argparse
 import csv
 import json
 import statistics
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from metrics_stratified import mean_ci95  # noqa: E402
 
 METRICS = ("rmse", "mae", "r2")
 
@@ -46,12 +50,17 @@ def load_runs(root: Path):
 
 
 def summarize(values):
-    """(mean, sample std) — std is 0.0 for a single run rather than an error."""
+    """(mean, sample std, 95% CI half-width of the mean).
+
+    The CI uses t(0.975, n-1), not 1.96 — at the n=5 seed counts used here the
+    normal approximation would understate the interval by roughly 40%.
+    """
     if not values:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     if len(values) == 1:
-        return values[0], 0.0
-    return statistics.mean(values), statistics.stdev(values)
+        return values[0], 0.0, 0.0
+    mean, half, _n = mean_ci95(values)
+    return mean, statistics.stdev(values), half
 
 
 def main():
@@ -90,14 +99,15 @@ def main():
         rows.append((source, len(per_seed), cols))
 
     n_label = f"{args.split} split"
-    print(f"\n{n_label}: mean +/- std over seeds (ddof=1)\n")
+    print(f"\n{n_label}: mean +/- 95% CI of the mean over seeds "
+          f"(t(0.975, n-1))\n")
     print(f"{'source':<10} {'n':>3}  {'RMSE (m)':>16} {'MAE (m)':>16} {'R2':>16}")
     print("-" * 68)
     for source, n_seeds, cols in rows:
         cells = []
         for m in METRICS:
-            mean, std = cols[m]
-            cells.append(f"{mean:.3f} +/- {std:.3f}")
+            mean, _std, half = cols[m]
+            cells.append(f"{mean:.3f} +/- {half:.3f}")
         print(f"{source:<10} {n_seeds:>3}  {cells[0]:>16} {cells[1]:>16} {cells[2]:>16}")
     print()
 
@@ -109,9 +119,9 @@ def main():
         for source, n_seeds, cols in rows:
             cells = []
             for m in STRAT_METRICS:
-                mean, std = cols[m]
+                mean, _std, half = cols[m]
                 cells.append("n/a" if cols[f"n_{m}"] == 0
-                             else f"{mean:.3f} +/- {std:.3f}")
+                             else f"{mean:.3f} +/- {half:.3f}")
             print(f"{source:<10} {n_seeds:>3}  " + " ".join(f"{c:>16}" for c in cells))
         print("\n  macro_*    = unweighted mean over height bins; every height class counts\n"
               "               equally, so tall-canopy error is no longer drowned out by the\n"
@@ -134,12 +144,12 @@ def main():
             w = csv.writer(f)
             w.writerow(["source", "split", "n_seeds"]
                        + [c for m in METRICS + STRAT_METRICS
-                          for c in (f"{m}_mean", f"{m}_std")])
+                          for c in (f"{m}_mean", f"{m}_std", f"{m}_ci95")])
             for source, n_seeds, cols in rows:
                 out = [source, args.split, n_seeds]
                 for m in METRICS + STRAT_METRICS:
-                    mean, std = cols[m]
-                    out += [f"{mean:.6f}", f"{std:.6f}"]
+                    mean, std, half = cols[m]
+                    out += [f"{mean:.6f}", f"{std:.6f}", f"{half:.6f}"]
                 w.writerow(out)
         print(f"Wrote {args.csv}")
 
