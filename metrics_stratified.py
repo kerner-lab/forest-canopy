@@ -162,3 +162,43 @@ def evaluate_and_report(y_true, y_pred, label, bin_size=10.0, max_height=60.0,
         min_bin_n=min_bin_n, balance_seed=balance_seed)
     print_stratified(m['stratified'], indent=indent)
     return m
+
+
+# Student-t 97.5th percentile by degrees of freedom, for a two-sided 95% CI.
+# Hardcoded so this module keeps working without scipy. At n=5 (df=4) t=2.776,
+# NOT 1.96 — using the normal approximation would understate the interval by
+# ~40%, which matters a lot at the seed counts used here.
+_T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+         7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179,
+         13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101,
+         19: 2.093, 20: 2.086, 25: 2.060, 30: 2.042}
+
+
+def t975(df):
+    """Two-sided 95% t multiplier for `df` degrees of freedom."""
+    if df <= 0:
+        return float("nan")
+    if df in _T975:
+        return _T975[df]
+    keys = sorted(_T975)
+    if df > keys[-1]:
+        return 1.96
+    return _T975[min(k for k in keys if k >= df)]
+
+
+def mean_ci95(values):
+    """(mean, half-width of the two-sided 95% CI of the MEAN, n).
+
+    Half-width = t(0.975, n-1) * s / sqrt(n). This is the interval on the mean —
+    the right thing when the reported number IS the mean. It is NOT the spread of
+    the seed values themselves; that would be t * s, wider by sqrt(n).
+    """
+    v = [float(x) for x in values if x is not None and np.isfinite(x)]
+    n = len(v)
+    if n == 0:
+        return float("nan"), float("nan"), 0
+    if n == 1:
+        return v[0], 0.0, 1
+    mean = float(np.mean(v))
+    sd = float(np.std(v, ddof=1))
+    return mean, t975(n - 1) * sd / np.sqrt(n), n
