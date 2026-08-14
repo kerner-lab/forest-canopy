@@ -250,10 +250,6 @@ def figure_bins(results, args, out_path):
 
     ax1.set_title("Error by canopy-height class", color=INK, fontsize=13,
                   fontweight="600", loc="left", pad=10)
-    fig.text(0.02, -0.01,
-             "Every height class weighted equally — unlike the overall RMSE, "
-             "which is dominated by the short-canopy bins.",
-             color=INK_MUTED, fontsize=9, ha="left", va="top")
     fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"wrote {out_path}")
