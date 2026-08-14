@@ -348,9 +348,19 @@ class GEDIPredictor30m:
             print(f"  {msg}")
             self.logger.info(msg)
             if len(tiles) == 0:
-                raise ValueError(
-                    f"Tile allowlist removed every tile from split '{split_name}'. "
-                    f"Check that the list matches the shapefile's healpix_id values.")
+                # Fatal for train (nothing to fit), but an empty val/test is a
+                # legitimate configuration — e.g. a master list built from the
+                # train+test splits only. evaluate() returns None for those and
+                # main() already skips missing metrics.
+                if split_name == 'train':
+                    raise ValueError(
+                        f"Tile allowlist removed every tile from split '{split_name}'. "
+                        f"Check that the list matches the shapefile's healpix_id values.")
+                warn = (f"Tile allowlist removed every tile from split '{split_name}' "
+                        f"— skipping this split.")
+                print(f"  WARNING: {warn}")
+                self.logger.warning(warn)
+                return None, None
         if (self.subset_fraction is not None and self.subset_fraction < 1.0
                 and split_name in self.subset_splits):
             rng = np.random.default_rng(self.subset_seed)
