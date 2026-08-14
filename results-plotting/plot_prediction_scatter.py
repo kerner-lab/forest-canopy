@@ -131,20 +131,31 @@ def figure_density(results, args, out_path):
                              squeeze=False)
     hi = args.max_height + args.bin_size
 
+    hb = None
+    rng = np.random.default_rng(0)
     for ax, (src, r) in zip(axes.ravel(), results):
         style_axes(ax)
         yt, yp = r["df"]["y_true"].to_numpy(), r["df"]["y_pred"].to_numpy()
-        hb = ax.hexbin(yt, yp, gridsize=args.gridsize, extent=(0, hi, 0, hi),
-                       cmap=DENSITY_CMAP, norm=LogNorm(vmin=1), mincnt=1,
-                       linewidths=0, zorder=1)
-        # 1:1 reference, recessive.
+
+        if args.style == "hexbin":
+            hb = ax.hexbin(yt, yp, gridsize=args.gridsize, extent=(0, hi, 0, hi),
+                           cmap=DENSITY_CMAP, norm=LogNorm(vmin=1), mincnt=1,
+                           linewidths=0, zorder=1)
+        else:
+            # Plain scatter, matching the convention in _plot_predictions().
+            # Subsampled so a multi-million-row split stays renderable; the same
+            # seed is used for every panel so the point budget is comparable.
+            if args.max_points and len(yt) > args.max_points:
+                sel = rng.choice(len(yt), size=args.max_points, replace=False)
+                sy, sp = yt[sel], yp[sel]
+            else:
+                sy, sp = yt, yp
+            ax.scatter(sy, sp, s=args.point_size, alpha=args.point_alpha,
+                       color=SERIES[0], linewidths=0, zorder=1, rasterized=True)
+
+        # 1:1 reference, recessive so it does not read as a data series.
         ax.plot([0, hi], [0, hi], color=INK_MUTED, linewidth=1.5,
                 linestyle=(0, (5, 4)), zorder=3)
-        # Per-bin mean prediction: where the model actually sits vs truth.
-        c, _rmse, bias, _s = r["bins"]
-        ax.plot(c, c + bias, color=INK, linewidth=2.0, marker="o",
-                markersize=4.5, markerfacecolor="white",
-                markeredgewidth=1.6, zorder=4)
 
         m = r["overall"]
         ax.set_title(LABELS.get(src, src), color=INK, fontsize=12,
@@ -174,19 +185,22 @@ def figure_density(results, args, out_path):
                 axes[r_i][c_i].set_xlabel("GEDI height (m)", color=INK_2, fontsize=10)
                 break
 
-    cbar = fig.colorbar(hb, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
-    cbar.set_label("pixels per hexagon", color=INK_2, fontsize=9)
-    cbar.ax.tick_params(colors=INK_2, labelsize=8, length=0)
-    cbar.outline.set_visible(False)
+    if hb is not None:
+        cbar = fig.colorbar(hb, ax=axes.ravel().tolist(), fraction=0.02, pad=0.02)
+        cbar.set_label("pixels per hexagon", color=INK_2, fontsize=9)
+        cbar.ax.tick_params(colors=INK_2, labelsize=8, length=0)
+        cbar.outline.set_visible(False)
 
     # Title above; the explanatory note goes BELOW the panels as a caption, which
     # is the paper convention and avoids colliding with the title in figure coords.
     fig.suptitle("Predicted vs GEDI canopy height, seed-averaged",
                  color=INK, fontsize=14, fontweight="600", x=0.02, ha="left",
                  y=1.005)
+    note = "Dashed line 1:1."
+    if args.style == "scatter" and args.max_points:
+        note += f" Up to {args.max_points:,} points per panel."
     fig.text(0.02, -0.01,
-             "Dashed line 1:1; solid line with markers = mean prediction per "
-             "height bin.\nMetrics are for the seed-mean ensemble, not the "
+             note + "\nMetrics are for the seed-mean ensemble, not the "
              "reported per-seed scores.",
              color=INK_MUTED, fontsize=9, ha="left", va="top", linespacing=1.5)
     fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
@@ -258,6 +272,16 @@ def main():
     ap.add_argument("--bin-size", type=float, default=10.0)
     ap.add_argument("--max-height", type=float, default=60.0)
     ap.add_argument("--min-bin-n", type=int, default=100)
+    ap.add_argument("--style", default="scatter", choices=["scatter", "hexbin"],
+                    help="panel style: plain scatter (default, matches the existing "
+                         "prediction plots) or a 2-D density hexbin")
+    ap.add_argument("--max-points", type=int, default=200000,
+                    help="scatter only: subsample to at most this many points per "
+                         "panel (0 = plot all; default 200000)")
+    ap.add_argument("--point-size", type=float, default=1.5,
+                    help="scatter marker size (default: 1.5)")
+    ap.add_argument("--point-alpha", type=float, default=0.25,
+                    help="scatter marker alpha (default: 0.25)")
     ap.add_argument("--gridsize", type=int, default=70,
                     help="hexbin resolution (default: 70)")
     ap.add_argument("--no-save-parquet", action="store_true",
