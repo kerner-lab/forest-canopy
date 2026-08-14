@@ -52,7 +52,7 @@ class GEDIPredictor30m:
                  subset_fraction=None, subset_seed=42, subset_splits=None,
                  stratified_sample_fraction=None, stratified_sample_seed=42,
                  stratified_splits=None, model_type='rf', embedding_source='olmo',
-                 include_zeros=False):
+                 include_zeros=False, tile_allowlist=None):
         """
         Args:
             shapefile_path: Path to healpix shapefile with 'split' column
@@ -85,7 +85,7 @@ class GEDIPredictor30m:
                            zero-filtered .npz cache is loaded.
         """
         _VALID_MODELS = ('rf', 'xgb', 'gb', 'lr')
-        _VALID_SOURCES = ('olmo', 'aef', 'tessera')
+        _VALID_SOURCES = ('olmo', 'aef', 'tessera', 'presto', 'prithvi')
         if embedding_source not in _VALID_SOURCES:
             raise ValueError(f"embedding_source must be one of {_VALID_SOURCES}")
         if model_type not in _VALID_MODELS:
@@ -112,6 +112,10 @@ class GEDIPredictor30m:
         self.stratified_sample_fraction = stratified_sample_fraction
         self.stratified_sample_seed = stratified_sample_seed
         self.stratified_splits = set(stratified_splits) if stratified_splits else {'train'}
+        # Restrict every split to these healpix ids. Used to hold the tile set fixed
+        # across embedding sources so their metrics are comparable — without it a
+        # source with fewer cached tiles is silently scored on a different dataset.
+        self.tile_allowlist = set(int(t) for t in tile_allowlist) if tile_allowlist else None
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._setup_logging()
@@ -335,6 +339,18 @@ class GEDIPredictor30m:
         reads X only for those rows. Peak memory stays at ~10% of full dataset.
         """
         tiles = self.gdf[self.gdf['split'] == split_name]['healpix_id'].values
+        # Applied BEFORE subset/stratified sampling so those operate on the common
+        # tile set, not on tiles that would later be dropped anyway.
+        if self.tile_allowlist is not None:
+            n_before = len(tiles)
+            tiles = np.array([t for t in tiles if int(t) in self.tile_allowlist])
+            msg = (f"Tile allowlist '{split_name}': {len(tiles)}/{n_before} tiles kept")
+            print(f"  {msg}")
+            self.logger.info(msg)
+            if len(tiles) == 0:
+                raise ValueError(
+                    f"Tile allowlist removed every tile from split '{split_name}'. "
+                    f"Check that the list matches the shapefile's healpix_id values.")
         if (self.subset_fraction is not None and self.subset_fraction < 1.0
                 and split_name in self.subset_splits):
             rng = np.random.default_rng(self.subset_seed)
@@ -902,8 +918,10 @@ def main():
                         help='Output directory for models and results')
     parser.add_argument('--embedding-format', choices=['float32', 'int8'], default='float32',
                         help='Embedding format to load (default: float32)')
-    parser.add_argument('--embedding-source', choices=['olmo', 'aef', 'tessera'], default='olmo',
-                        help='Embedding source: olmo or aef (default: olmo). '
+    parser.add_argument('--embedding-source',
+                        choices=['olmo', 'aef', 'tessera', 'presto', 'prithvi'], default='olmo',
+                        help='Embedding source: olmo, aef, tessera, presto or prithvi '
+                             '(default: olmo). '
                              'Used for output naming and metadata. When --year is provided '
                              'and --preprocessed-dir is omitted, auto-constructs path as '
                              '{embeddings-dir}/{year}/{embedding-source}/.')
@@ -957,6 +975,12 @@ def main():
     parser.add_argument('--stratified-splits', nargs='+', default=['train'],
                         metavar='SPLIT',
                         help='Which splits to apply stratified sampling to (default: train)')
+    parser.add_argument('--tile-list', default=None, metavar='PATH',
+                        help='File of healpix ids (one per line) restricting EVERY split. '
+                             'Use the master list from build_master_tile_list.py so all '
+                             'embedding sources train and evaluate on identical tiles — '
+                             'otherwise a source with fewer cached tiles is scored on a '
+                             'different dataset and the comparison is confounded.')
     parser.add_argument('--include-zeros', action='store_true',
                         help='Include GEDI height == 0 measurements in the analysis '
                              '(gedi_data >= 0). For the preprocessed path this loads the '
@@ -971,6 +995,17 @@ def main():
             Path(args.embeddings_dir) / str(args.year) / args.embedding_source
         )
         print(f"Auto-constructed preprocessed-dir: {args.preprocessed_dir}")
+
+    tile_allowlist = None
+    if args.tile_list:
+        p = Path(args.tile_list)
+        if not p.is_file():
+            parser.error(f"--tile-list not found: {p}")
+        tile_allowlist = [int(ln) for ln in p.read_text().split()
+                          if ln.strip() and not ln.strip().startswith('#')]
+        if not tile_allowlist:
+            parser.error(f"--tile-list is empty: {p}")
+        print(f"Tile allowlist: {len(tile_allowlist)} ids from {p}")
 
     predictor = GEDIPredictor30m(
         shapefile_path=args.shapefile,
@@ -988,6 +1023,7 @@ def main():
         model_type=args.model,
         embedding_source=args.embedding_source,
         include_zeros=args.include_zeros,
+        tile_allowlist=tile_allowlist,
     )
 
     train_metrics = predictor.train(
@@ -1015,6 +1051,12 @@ def main():
         'model': args.model,
         'year': args.year,
         'include_zeros': args.include_zeros,
+        # Recorded so a multi-seed study can group runs by seed after the fact.
+        'random_state': args.random_state,
+        'subset_seed': args.subset_seed,
+        'stratified_sample_seed': args.stratified_sample_seed,
+        'tile_list': args.tile_list,
+        'n_tiles_allowed': len(tile_allowlist) if tile_allowlist else None,
     }
 
     predictor.plot_feature_importance(top_n=30)
