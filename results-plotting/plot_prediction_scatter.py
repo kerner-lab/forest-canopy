@@ -68,6 +68,11 @@ INK_2 = "#5c5b55"
 INK_MUTED = "#8a8981"
 GRID = "#e6e5e0"
 
+# Reference lines, three distinguishable weights of neutral:
+ONE_TO_ONE = "#b3b2aa"    # light grey  — y = x
+OVERALL_FIT = "#6d6c64"   # mid grey    — overall least-squares fit
+# per-bin fits use INK (near-black, solid)
+
 # Nicer display names; anything not listed falls back to the directory name.
 LABELS = {"aef": "AlphaEarth", "olmo": "OlmoEarth", "tessera": "TESSERA",
           "presto": "Presto", "prithvi": "Prithvi"}
@@ -198,12 +203,22 @@ def figure_density(results, args, out_path):
             for e in np.arange(args.bin_size, args.max_height + args.bin_size,
                                args.bin_size):
                 if e < hi:
-                    ax.axvline(e, color=INK_MUTED, linewidth=0.9,
-                               linestyle=(0, (1, 3)), zorder=2)
+                    ax.axvline(e, color=INK_2, linewidth=1.2,
+                               linestyle=(0, (1, 2.5)), zorder=2)
 
-        # 1:1 reference, recessive so it does not read as a data series.
-        ax.plot([0, hi], [0, hi], color=INK_MUTED, linewidth=1.5,
-                linestyle=(0, (5, 4)), zorder=3)
+        # Three references, deliberately distinct so they cannot be confused:
+        #   light grey dashed  y = x (perfect agreement)
+        #   mid grey dashed    overall least-squares fit
+        #   black solid        per-bin least-squares fits
+        if args.one_to_one:
+            ax.plot([0, hi], [0, hi], color=ONE_TO_ONE, linewidth=1.6,
+                    linestyle=(0, (5, 4)), zorder=3)
+
+        if args.overall_fit and np.ptp(yt) > 0:
+            slope, intercept = np.polyfit(yt, yp, 1)
+            xs = np.array([0.0, hi])
+            ax.plot(xs, slope * xs + intercept, color=OVERALL_FIT,
+                    linewidth=2.2, linestyle=(0, (7, 3)), zorder=4)
 
         # Per-bin least-squares fit, drawn as one segment per height bin and
         # deliberately NOT joined between bins — the breaks show where the
@@ -221,7 +236,7 @@ def figure_density(results, args, out_path):
                 slope, intercept = np.polyfit(yt[m], yp[m], 1)
                 xs = np.array([lo, min(up, hi)])
                 ax.plot(xs, slope * xs + intercept, color=INK,
-                        linewidth=2.0, solid_capstyle="round", zorder=4)
+                        linewidth=2.2, solid_capstyle="round", zorder=5)
 
         # No metrics annotation inside the axes — the numbers belong in the table
         # from aggregate_seed_sweep.py, not printed over the data.
@@ -260,9 +275,13 @@ def figure_density(results, args, out_path):
     fig.suptitle("Predicted vs GEDI canopy height, seed-averaged",
                  color=INK, fontsize=14, fontweight="600", x=0.02, ha="left",
                  y=1.005)
-    note = "Dashed line 1:1."
+    note = ""
+    if args.one_to_one:
+        note += "Light grey dashed: 1:1. "
+    if args.overall_fit:
+        note += "Mid grey dashed: overall least-squares fit. "
     if args.fit_bins:
-        note += f" Solid segments: least-squares fit within each {args.bin_size:.0f} m bin."
+        note += f"Black solid: least-squares fit within each {args.bin_size:.0f} m bin."
     if args.style == "scatter" and args.max_points:
         note += f" Up to {args.max_points:,} points per panel."
     fig.text(0.02, -0.01,
@@ -328,6 +347,12 @@ def main():
     ap.add_argument("--bin-size", type=float, default=10.0)
     ap.add_argument("--max-height", type=float, default=60.0)
     ap.add_argument("--min-bin-n", type=int, default=100)
+    ap.add_argument("--overall-fit", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="dashed least-squares fit over the whole range")
+    ap.add_argument("--one-to-one", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="draw the y=x reference (--no-one-to-one to omit)")
     ap.add_argument("--fit-bins", action=argparse.BooleanOptionalAction, default=True,
                     help="draw a per-bin least-squares fit segment in each panel "
                          "(--no-fit-bins to omit)")
