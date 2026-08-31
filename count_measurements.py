@@ -89,6 +89,12 @@ def main():
     ap.add_argument("--atol", type=float, default=1e-4,
                     help="tolerance in metres when comparing y vectors (default: 1e-4, "
                          "well below GEDI's 1 cm storage resolution)")
+    ap.add_argument("--max-pixel-diff-frac", type=float, default=0.0, metavar="F",
+                    help="tolerate a tile whose per-source pixel COUNT differs from the "
+                         "reference by <= F of the reference count (e.g. 0.10 for 10%%). "
+                         "Default 0.0 = exact match required. A tolerated tile is kept in "
+                         "the aligned lists even though the sources hold slightly "
+                         "different pixels — see the caveat printed with the summary.")
     ap.add_argument("--no-check-alignment", action="store_true",
                     help="only count; skip the cross-source pixel-identity check")
     ap.add_argument("--max-report", type=int, default=20,
@@ -162,15 +168,25 @@ def main():
                 if name == reference:
                     continue
                 if len(y) != len(ref):
+                    frac = abs(len(y) - len(ref)) / len(ref) if len(ref) else 1.0
                     mismatch[split][name].append(
                         {"tile": tid, "reason": "length",
-                         "n": int(len(y)), "n_ref": int(len(ref))})
+                         "n": int(len(y)), "n_ref": int(len(ref)),
+                         "frac": frac,
+                         "tolerated": frac <= args.max_pixel_diff_frac})
                 elif not np.allclose(y, ref, rtol=0, atol=args.atol, equal_nan=True):
+                    # Equal length but different values means the sources dropped the
+                    # SAME NUMBER of different pixels. Under the subsequence structure
+                    # that offsets every later row, so an element-wise differing count
+                    # overstates the real divergence and cannot be thresholded
+                    # meaningfully. Never tolerated — it is structurally different from
+                    # a plain count gap and warrants a look.
                     bad = int(np.sum(~np.isclose(y, ref, rtol=0, atol=args.atol,
                                                  equal_nan=True)))
                     mismatch[split][name].append(
                         {"tile": tid, "reason": "values",
-                         "n_differing": bad, "n": int(len(y))})
+                         "n_differing": bad, "n": int(len(y)),
+                         "frac": 1.0, "tolerated": False})
         if sys.stderr.isatty():
             print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
 
@@ -207,30 +223,52 @@ def main():
     if not args.no_check_alignment:
         print(f"\nPixel alignment (reference = '{reference}', atol = {args.atol} m)")
         print("-" * 72)
+        if args.max_pixel_diff_frac > 0:
+            print(f"  tolerating count gaps <= {100*args.max_pixel_diff_frac:.1f}% "
+                  f"of the reference pixel count")
         clean = True
+        worst = 0.0
         for split in wanted:
             for name in sources:
                 if name == reference:
                     continue
                 bad = mismatch[split][name]
+                hard = [m for m in bad if not m["tolerated"]]
+                soft = [m for m in bad if m["tolerated"]]
+                worst = max([worst] + [m["frac"] for m in soft])
                 if not bad:
                     print(f"  {split:<8} {name:<10} OK — identical pixel sets")
                     continue
+                if not hard:
+                    biggest = max(m["frac"] for m in soft)
+                    print(f"  {split:<8} {name:<10} OK — {len(soft)} tile(s) within "
+                          f"tolerance (worst {100*biggest:.2f}%)")
+                    continue
                 clean = False
-                print(f"  {split:<8} {name:<10} {len(bad)} tile(s) DIFFER from "
-                      f"'{reference}':")
-                for m in bad[:args.max_report]:
+                print(f"  {split:<8} {name:<10} {len(hard)} tile(s) EXCEED tolerance "
+                      f"({len(soft)} within it):")
+                for m in hard[:args.max_report]:
                     if m["reason"] == "length":
                         print(f"      tile {m['tile']}: {m['n']} px vs "
-                              f"{m['n_ref']} px (diff {m['n'] - m['n_ref']:+d})")
+                              f"{m['n_ref']} px (diff {m['n'] - m['n_ref']:+d}, "
+                              f"{100*m['frac']:.2f}%)")
                     else:
                         print(f"      tile {m['tile']}: same length, "
-                              f"{m['n_differing']}/{m['n']} y values differ")
-                if len(bad) > args.max_report:
-                    print(f"      ... and {len(bad) - args.max_report} more")
-        if clean:
+                              f"{m['n_differing']}/{m['n']} y values differ "
+                              f"— different pixels, not a count gap")
+                if len(hard) > args.max_report:
+                    print(f"      ... and {len(hard) - args.max_report} more")
+        if worst > 0:
+            print(f"\n  CAVEAT: tiles kept under --max-pixel-diff-frac hold slightly\n"
+                  f"  DIFFERENT pixels per encoder (worst gap {100*worst:.2f}% of the\n"
+                  f"  reference count). The comparison is no longer pixel-identical —\n"
+                  f"  report N per encoder, or the reference N with the max gap stated.")
+        if clean and worst == 0.0:
             print("\n  All sources sampled identical pixels on every tile — the "
                   "measurement\n  counts above are directly comparable across encoders.")
+        elif clean:
+            print("\n  Every remaining gap is within tolerance; no tile is excluded for\n"
+                  "  misalignment. See the CAVEAT above for how to report N.")
         else:
             print("\n  WARNING: sources do NOT share a pixel set on every tile, so the\n"
                   "  encoders are not being scored on identical data. A 'length' diff is\n"
@@ -251,7 +289,8 @@ def main():
         ad.mkdir(parents=True, exist_ok=True)
         print(f"\nAligned tile lists -> {ad}")
         for split, ids in wanted.items():
-            bad = {m["tile"] for name in sources for m in mismatch[split][name]}
+            bad = {m["tile"] for name in sources for m in mismatch[split][name]
+                   if not m["tolerated"]}
             absent = {t for name in sources for t in missing[split][name]}
             keep = [t for t in ids if t not in bad and t not in absent]
             aligned[split] = keep
@@ -266,11 +305,22 @@ def main():
         master = ad / "aligned_tile_ids.txt"
         master.write_text("\n".join(str(t) for t in every) + "\n" if every else "")
         print(f"  {'all':<8} {len(every):>4}                            -> {master}")
-        n_meas = {s: sum(counts[s][reference].get(t, 0) for t in aligned[s])
-                  for s in aligned}
-        print("\n  Measurements on the aligned set (identical for every source):")
-        for s, n_m in n_meas.items():
-            print(f"    {s:<8} {len(aligned[s]):>4} tiles  {fmt_int(n_m):>14} px")
+        print("\n  Measurements on the aligned set:")
+        for s in aligned:
+            per_src = {n: sum(counts[s][n].get(t, 0) for t in aligned[s])
+                       for n in sources}
+            lo, hi = min(per_src.values()), max(per_src.values())
+            ref_n = per_src[reference]
+            if lo == hi:
+                print(f"    {s:<8} {len(aligned[s]):>4} tiles  {fmt_int(ref_n):>14} px "
+                      f"(identical for every source)")
+            else:
+                spread = 100.0 * (hi - lo) / hi if hi else 0.0
+                print(f"    {s:<8} {len(aligned[s]):>4} tiles  {fmt_int(ref_n):>14} px "
+                      f"({reference}); per-source range {fmt_int(lo)}–{fmt_int(hi)}, "
+                      f"spread {spread:.2f}%")
+                for n in sources:
+                    print(f"        {n:<10} {fmt_int(per_src[n]):>14}")
         print("\n  Use for BOTH models and baselines:")
         print(f"    run_gedi_prediction_30m.py ... --tile-list {master}")
         print(f"    potapov_baseline.py        ... --tile-list {master}")
