@@ -6,9 +6,13 @@ georeferenced .tif, and plot a map with a colorbar.
 
 Pipeline
 --------
+0. SELECT TILES: take the healpix tiles of the requested --split, then DROP every tile
+   whose footprint overlaps the prediction AOI, so the wall-to-wall map is not predicted
+   from pixels the model was trained on (no spatial data leakage).
 1. TRAIN: load the per-tile (X, y) .npz produced by alphaearth_processing.py for the
-   TRAIN-split healpix tiles, across one or more year directories (e.g. 2019-2022), and
-   fit a RandomForestRegressor.  X = (N, 64) AEF channels, y = canopy height in METERS.
+   remaining TRAIN-split healpix tiles, across one or more year directories (e.g.
+   2019-2022), and fit a RandomForestRegressor.  X = (N, 64) AEF channels, y = canopy
+   height in METERS.
 2. PREDICT: read the wall-to-wall AOI GeoTIFF from alphaearth_wall_to_wall.py
    (64 bands `aef_ch_001..064`, float32, NaN nodata) — band order matches X — flatten to
    (pixels, 64), predict on the valid (finite) pixels, and reshape back to the grid.
@@ -20,6 +24,7 @@ Usage
 -----
     python run_aef_rf_wall_to_wall.py \
         --shapefile /path/healpix.shp \
+        --aoi-shapefile /path/oregon_aoi.shp \
         --train-dirs /data/aef/2019 /data/aef/2020 /data/aef/2021 /data/aef/2022 \
         --aoi-tif    /path/oregon_validation.tif \
         --output-tif /path/oregon_canopy_height_rf.tif \
@@ -28,7 +33,15 @@ Usage
 Notes
 -----
 - Each --train-dirs entry is a directory of healpix_<id>_float32[_withzeros].npz (one AEF
-  year). Train tiles are gdf[gdf.split == --split]; tiles missing in a given year are skipped.
+  year). Train tiles are gdf[gdf.split == --split] minus the AOI-overlapping tiles; tiles
+  missing in a given year are skipped.
+- AOI leakage guard: pass --aoi-shapefile (the same boundary shapefile given to
+  alphaearth_wall_to_wall.py). Without it the AOI footprint falls back to the bounding box
+  of --aoi-tif, which is a superset of the real polygon and therefore still leak-safe (it
+  may drop a few extra tiles). --aoi-buffer-m adds a guard band around the AOI;
+  --no-exclude-aoi-overlap turns the guard off entirely (leaky — diagnostics only).
+- Overlap is measured as intersected area / tile area in an equal-area CRS, so a healpix
+  tile that merely shares an edge with the AOI (zero-area touch) is NOT dropped.
 - --include-zeros loads the *_withzeros.npz caches (0 m heights kept). 0 m is treated as a
   valid prediction throughout (it is NOT used as nodata).
 - The AOI .tif and the training X must have the same 64 channels in the same order — both
@@ -44,7 +57,9 @@ from pathlib import Path
 import numpy as np
 import geopandas as gpd
 import rasterio
+import rasterio.warp
 from rasterio.transform import array_bounds
+from shapely.geometry import box
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
@@ -56,17 +71,94 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# 0. Tile selection (AOI leakage guard)
+# ---------------------------------------------------------------------------
+
+# Equal-area CRS used only to measure overlap areas/fractions (not for output).
+EQUAL_AREA_CRS = "EPSG:6933"
+
+
+def load_aoi_geometry(aoi_shapefile, aoi_tif):
+    """Return (AOI footprint as one shapely geometry in EPSG:4326, description).
+
+    Prefers the boundary shapefile (the true polygon). Falls back to the bounding box of
+    the AOI GeoTIFF, which encloses the polygon — a superset, so still leak-safe.
+    """
+    if aoi_shapefile:
+        g = gpd.read_file(aoi_shapefile)
+        if g.crs is None:
+            print("Warning: --aoi-shapefile has no CRS; assuming EPSG:4326", file=sys.stderr)
+            g = g.set_crs(4326)
+        return g.to_crs(4326).union_all(), f"{aoi_shapefile} ({len(g)} feature(s))"
+
+    with rasterio.open(aoi_tif) as src:
+        if src.crs is None:
+            sys.exit("ERROR: --aoi-tif has no CRS; pass --aoi-shapefile for the AOI footprint")
+        left, bottom, right, top = rasterio.warp.transform_bounds(
+            src.crs, "EPSG:4326", *src.bounds)
+    return box(left, bottom, right, top), f"bounding box of {aoi_tif}"
+
+
+def select_train_tiles(gdf, split, aoi_geom, buffer_m, max_overlap_frac, n_print=15):
+    """Tile ids of `split`, minus every tile overlapping the AOI.
+
+    Overlap is intersected area / tile area in an equal-area CRS, so healpix neighbours
+    that only share an edge with the AOI (zero-area touch) survive. Returns
+    (kept_ids, dropped) where `dropped` is a list of {tile_id, overlap_frac} dicts.
+    """
+    if "split" not in gdf.columns:
+        sys.exit("ERROR: shapefile has no 'split' column")
+    if gdf.crs is None:
+        print("Warning: healpix shapefile has no CRS; assuming EPSG:4326", file=sys.stderr)
+        gdf = gdf.set_crs(4326)
+
+    tiles = gdf[gdf["split"] == split].copy()
+    ids = tiles["healpix_id"]
+    if np.issubdtype(ids.dtype, np.floating):  # some shapefiles store the id as a float
+        ids = ids.astype("int64")
+    tiles["tile_id"] = ids.astype(str)
+    print(f"Split '{split}': {len(tiles)} tiles")
+
+    if aoi_geom is None:
+        print("  AOI overlap guard DISABLED — training tiles may overlap the prediction AOI")
+        return tiles["tile_id"].tolist(), []
+
+    aoi = gpd.GeoSeries([aoi_geom], crs=4326)
+    if buffer_m:
+        aoi = aoi.to_crs(aoi.estimate_utm_crs()).buffer(buffer_m).to_crs(4326)
+    aoi_ea = aoi.to_crs(EQUAL_AREA_CRS).union_all()
+
+    tiles_ea = tiles.to_crs(EQUAL_AREA_CRS)
+    tile_area = tiles_ea.geometry.area.to_numpy()
+    inter_area = tiles_ea.geometry.intersection(aoi_ea).area.to_numpy()
+    frac = np.divide(inter_area, tile_area, out=np.zeros_like(inter_area),
+                     where=tile_area > 0)
+
+    drop = frac > max_overlap_frac
+    dropped = [{"tile_id": t, "overlap_frac": float(f)}
+               for t, f in zip(tiles["tile_id"].to_numpy()[drop], frac[drop])]
+    dropped.sort(key=lambda d: -d["overlap_frac"])
+    kept = tiles["tile_id"].to_numpy()[~drop].tolist()
+
+    print(f"  AOI overlap guard: dropped {len(dropped)} tile(s), kept {len(kept)}"
+          f"  (buffer={buffer_m:g} m, max_overlap_frac={max_overlap_frac:g})")
+    for d in dropped[:n_print]:
+        print(f"    - healpix {d['tile_id']}: {d['overlap_frac']*100:.1f}% inside AOI")
+    if len(dropped) > n_print:
+        print(f"    ... and {len(dropped)-n_print} more (full list in the output .json)")
+    if not kept:
+        sys.exit("ERROR: every training tile overlaps the AOI — nothing left to train on")
+    return kept, dropped
+
+
+# ---------------------------------------------------------------------------
 # 1. Training data
 # ---------------------------------------------------------------------------
 
-def load_training_data(shapefile, train_dirs, split, include_zeros, embedding_format,
+def load_training_data(tile_ids, train_dirs, include_zeros, embedding_format,
                        max_samples, seed):
-    """Concatenate (X, y) over the split's tiles across all train_dirs (years)."""
-    gdf = gpd.read_file(shapefile)
-    if "split" not in gdf.columns:
-        sys.exit("ERROR: shapefile has no 'split' column")
-    tile_ids = gdf[gdf["split"] == split]["healpix_id"].tolist()
-    print(f"Split '{split}': {len(tile_ids)} tiles  x {len(train_dirs)} year-dir(s)")
+    """Concatenate (X, y) over the selected tiles across all train_dirs (years)."""
+    print(f"Loading {len(tile_ids)} tiles x {len(train_dirs)} year-dir(s)")
 
     suffix = "_withzeros" if include_zeros else ""
     Xs, ys = [], []
@@ -98,7 +190,7 @@ def load_training_data(shapefile, train_dirs, split, include_zeros, embedding_fo
         idx = rng.choice(len(y), size=max_samples, replace=False)
         X, y = X[idx], y[idx]
         print(f"  subsampled to {max_samples:,} training pixels (seed={seed})")
-    return X, y, gdf
+    return X, y
 
 
 def train_rf(X, y, args):
@@ -234,6 +326,20 @@ def main():
     ap.add_argument("--output-plot", default=None,
                     help="output map PNG path (default: <output-tif>.png)")
     ap.add_argument("--split", default="train", help="shapefile split to train on")
+    # AOI leakage guard
+    ap.add_argument("--aoi-shapefile", default=None,
+                    help="boundary shapefile of the prediction AOI (the one passed to "
+                         "alphaearth_wall_to_wall.py). Training tiles overlapping it are "
+                         "dropped. Default: fall back to the --aoi-tif bounding box")
+    ap.add_argument("--aoi-buffer-m", type=float, default=0.0,
+                    help="expand the AOI by this many metres before testing overlap, to add "
+                         "a spatial guard band around the prediction region")
+    ap.add_argument("--max-overlap-frac", type=float, default=0.0,
+                    help="drop a train tile when (tile ∩ AOI area)/(tile area) exceeds this. "
+                         "0.0 (default) drops any tile with real overlap; edge-touching tiles "
+                         "(zero area) are kept")
+    ap.add_argument("--no-exclude-aoi-overlap", action="store_true",
+                    help="do NOT drop AOI-overlapping train tiles (leaky — diagnostics only)")
     ap.add_argument("--include-zeros", action="store_true",
                     help="load *_withzeros.npz (keep 0 m GEDI heights as valid training samples)")
     ap.add_argument("--embedding-format", default="float32",
@@ -266,10 +372,20 @@ def main():
     output_tif.parent.mkdir(parents=True, exist_ok=True)
     output_plot = Path(args.output_plot) if args.output_plot else output_tif.with_suffix(".png")
 
+    # 0. Select training tiles, excluding any that overlap the prediction AOI
+    if args.no_exclude_aoi_overlap:
+        aoi_geom, aoi_desc = None, "disabled"
+    else:
+        aoi_geom, aoi_desc = load_aoi_geometry(args.aoi_shapefile, args.aoi_tif)
+        print(f"AOI footprint from: {aoi_desc}")
+    gdf = gpd.read_file(args.shapefile)
+    tile_ids, dropped = select_train_tiles(
+        gdf, args.split, aoi_geom, args.aoi_buffer_m, args.max_overlap_frac)
+
     # 1. Train
     max_samples = args.max_train_samples if args.max_train_samples > 0 else None
-    X, y, _ = load_training_data(
-        args.shapefile, args.train_dirs, args.split, args.include_zeros,
+    X, y = load_training_data(
+        tile_ids, args.train_dirs, args.include_zeros,
         args.embedding_format, max_samples, args.random_state)
     rf, metrics = train_rf(X, y, args)
     n_features = X.shape[1]
@@ -291,6 +407,17 @@ def main():
     meta = {
         "shapefile": args.shapefile, "split": args.split, "train_dirs": args.train_dirs,
         "include_zeros": args.include_zeros, "n_features": int(n_features),
+        "aoi_exclusion": {
+            "enabled": not args.no_exclude_aoi_overlap,
+            "aoi_source": aoi_desc,
+            "aoi_shapefile": args.aoi_shapefile,
+            "buffer_m": args.aoi_buffer_m,
+            "max_overlap_frac": args.max_overlap_frac,
+            "n_tiles_kept": len(tile_ids),
+            "n_tiles_dropped": len(dropped),
+            "tiles_kept": tile_ids,
+            "tiles_dropped": dropped,
+        },
         "aoi_tif": args.aoi_tif, "output_tif": str(output_tif), "output_plot": str(output_plot),
         "n_valid_pixels": int(n_valid),
         "rf": {"n_estimators": args.n_estimators, "max_depth": args.max_depth,
