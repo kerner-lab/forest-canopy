@@ -85,6 +85,11 @@ def load_aoi_geometry(aoi_shapefile, aoi_tif):
     the AOI GeoTIFF, which encloses the polygon — a superset, so still leak-safe.
     """
     if aoi_shapefile:
+        if Path(aoi_shapefile).suffix.lower() in {".tif", ".tiff", ".vrt"}:
+            sys.exit(f"ERROR: --aoi-shapefile expects a VECTOR boundary (.shp/.geojson/.gpkg), "
+                     f"but got a raster: {aoi_shapefile}\n"
+                     f"       Omit --aoi-shapefile entirely — the AOI footprint then comes "
+                     f"from --aoi-tif, which is what you want here.")
         g = gpd.read_file(aoi_shapefile)
         if g.crs is None:
             print("Warning: --aoi-shapefile has no CRS; assuming EPSG:4326", file=sys.stderr)
