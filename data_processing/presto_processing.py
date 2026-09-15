@@ -26,7 +26,9 @@ Sentinel-2 observations of one pixel, optionally + S1 / ERA5 / SRTM) and outputs
 128-D vector for that pixel. So the pipeline here is:
 
   1. rslearn fetches a 12-month Sentinel-2 mosaic stack over each healpix tile
-     (UTM, 10 m), one monthly composite per timestep.
+     (UTM, 10 m), one monthly composite per timestep. Periods with no usable scene
+     are placed by date (not by position) and masked, so a gap never shifts the
+     months after it — see read_period_slots.
   2. For each VALID GEDI pixel we read its 12-month S2 time series (nearest 10 m
      S2 pixel), build the Presto input with the official
      presto.construct_single_presto_input, and run the encoder -> 128-D embedding.
@@ -417,30 +419,102 @@ def materialize_tile_rslearn(
     return win_dir
 
 
-def find_monthly_geotiffs(win_dir: Path) -> list:
+def read_period_slots(win_dir: Path, layer_name: str, logger: logging.Logger = None,
+                      n_slots: int = PRESTO_NUM_TIMESTEPS, period_days: int = 30) -> dict:
     """
-    Return the 12 monthly S2 GeoTIFF paths for a materialized window, in temporal
-    order. rslearn writes layer groups sentinel2, sentinel2.1, ..., each as
-    layers/<layer>/<bandset>/geotiff.tif.
+    Map each materialized layer-group index -> its chronological slot (0..n_slots-1).
+
+    WHY THIS EXISTS: rslearn drops periods that matched no scene instead of leaving a
+    hole — in data_sources/utils.py the per-period loop does `if period_groups:
+    groups.append(...)`. So on a tile where (say) February had no usable scene you get
+    11 groups numbered sentinel2, sentinel2.1 ... sentinel2.10 with the gap compacted
+    out, and layer group i is NOT month i. Feeding that compacted run to Presto as a
+    consecutive series (embed_pixels passes month=month0, which Presto expands to
+    month0, month0+1, ...) mislabels every timestep after the gap.
+
+    The true period is recoverable: items.json records the scene timestamps of each
+    group, and metadata.json records the window time range. rslearn anchors periods at
+    the window END and walks backwards (utils.py: `period_end = geometry.time_range[1]`,
+    then `period_start = period_end - period_duration`), so the period covering
+    [end-(k+1)*P, end-k*P) is the k-th from the end and its chronological slot is
+    n_slots-1-k.
+
+    Returns {} if the metadata isn't readable, so callers can fall back to positional
+    indexing (the old behaviour) rather than fail.
     """
-    paths = []
-    for i in range(PRESTO_NUM_TIMESTEPS):
-        layer = RSLEARN_LAYER if i == 0 else f"{RSLEARN_LAYER}.{i}"
-        p = win_dir / "layers" / layer / S2_BANDSET_NAME / "geotiff.tif"
-        if p.exists():
-            paths.append(p)
-    return paths
+    try:
+        meta = json.loads((win_dir / "metadata.json").read_text())
+        win_end = datetime.fromisoformat(meta["time_range"][1])
+        layer_datas = json.loads((win_dir / "items.json").read_text())
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if logger:
+            logger.warning("Could not read period metadata in %s (%s); falling back to "
+                           "positional month indexing", win_dir, exc)
+        return {}
+
+    period = period_days * 86400.0
+    slots = {}
+    for layer_data in layer_datas:
+        if layer_data.get("layer_name") != layer_name:
+            continue
+        for i, group in enumerate(layer_data.get("serialized_item_groups", [])):
+            times = []
+            for item in group:
+                try:
+                    times.append(datetime.fromisoformat(
+                        item["geometry"]["time_range"][0]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not times:
+                continue
+            # Any scene in the group falls inside that group's period; use the earliest.
+            k = int((win_end - min(times)).total_seconds() // period)
+            slot = n_slots - 1 - k
+            if 0 <= slot < n_slots:
+                slots[i] = slot
+            elif logger:
+                logger.warning("Layer %s group %d resolves to out-of-range slot %d; "
+                               "leaving it positional", layer_name, i, slot)
+    return slots
 
 
-def find_s1_monthly_geotiffs(win_dir: Path) -> list:
-    """The (up to 12) monthly Sentinel-1 VV/VH geotiffs for a window, temporal order."""
-    paths = []
+def find_monthly_geotiffs(win_dir: Path, layer_name: str = RSLEARN_LAYER,
+                          bandset: str = S2_BANDSET_NAME,
+                          logger: logging.Logger = None) -> tuple:
+    """
+    Return (paths, slots) for a materialized window: the monthly GeoTIFFs that exist and,
+    for each, its chronological slot (0..11) inside the 12-month window.
+
+    rslearn writes layer groups <layer>, <layer>.1, ... each as
+    layers/<layer>/<bandset>/geotiff.tif. Group index != month on tiles with partial
+    coverage, so the slot comes from read_period_slots (see its docstring); when that
+    metadata is unavailable we fall back to the group index.
+    """
+    slot_map = read_period_slots(win_dir, layer_name, logger)
+    paths, slots = [], []
     for i in range(PRESTO_NUM_TIMESTEPS):
-        layer = RSLEARN_S1_LAYER if i == 0 else f"{RSLEARN_S1_LAYER}.{i}"
-        p = win_dir / "layers" / layer / S1_BANDSET_NAME / "geotiff.tif"
+        layer = layer_name if i == 0 else f"{layer_name}.{i}"
+        p = win_dir / "layers" / layer / bandset / "geotiff.tif"
         if p.exists():
             paths.append(p)
-    return paths
+            slots.append(slot_map.get(i, i))
+    # Two groups resolving to one slot means the period maths disagrees with what was
+    # materialized; positional order is the safer fallback there.
+    if len(set(slots)) != len(slots):
+        if logger:
+            logger.warning("Duplicate period slots for layer %s in %s; falling back to "
+                           "positional month indexing", layer_name, win_dir)
+        slots = list(range(len(paths)))
+    return paths, slots
+
+
+def find_s1_monthly_geotiffs(win_dir: Path, logger: logging.Logger = None) -> tuple:
+    """(paths, slots) for the monthly Sentinel-1 VV/VH geotiffs — see find_monthly_geotiffs.
+
+    S1 is slotted independently of S2, so a month missing from one but not the other no
+    longer shifts either series.
+    """
+    return find_monthly_geotiffs(win_dir, RSLEARN_S1_LAYER, S1_BANDSET_NAME, logger)
 
 
 def s1_to_presto_db(s1_stack: np.ndarray, units: str = "linear") -> np.ndarray:
@@ -466,27 +540,40 @@ def s1_to_presto_db(s1_stack: np.ndarray, units: str = "linear") -> np.ndarray:
     return s1
 
 
-def find_imagery_dir_geotiffs(imagery_dir: Path, healpix_id: int) -> list:
-    """Fallback: read pre-materialized healpix_<id>_s2_<month>.tif (month 0..11)."""
-    paths = []
+def find_imagery_dir_geotiffs(imagery_dir: Path, healpix_id: int) -> tuple:
+    """Fallback: read pre-materialized healpix_<id>_s2_<month>.tif (month 0..11).
+
+    Returns (paths, slots). Here the month is in the filename, so the slot is that
+    month index directly — a missing month leaves its slot empty rather than shifting
+    the ones after it.
+    """
+    paths, slots = [], []
     for i in range(PRESTO_NUM_TIMESTEPS):
         for pat in (f"healpix_{healpix_id}_s2_{i}.tif", f"healpix_{healpix_id}_s2_{i:02d}.tif"):
             p = imagery_dir / pat
             if p.exists():
                 paths.append(p)
+                slots.append(i)
                 break
-    return paths
+    return paths, slots
 
 
 # ---------------------------------------------------------------------------
 # Load the monthly S2 stack
 # ---------------------------------------------------------------------------
 
-def load_s2_stack(geotiff_paths: list):
+def load_s2_stack(geotiff_paths: list, slots: list, n_bands_expected: int = None,
+                  n_slots: int = PRESTO_NUM_TIMESTEPS):
     """
-    Read monthly S2 GeoTIFFs into (T, n_bands, H, W) float32, plus the shared
-    transform/crs. All months must share the same grid (rslearn guarantees this for
-    one window). Returns (stack, transform, crs, height, width).
+    Read monthly GeoTIFFs into a fixed (n_slots, n_bands, H, W) float32 stack, placing
+    each file at its own slot rather than at its position in the list.
+
+    `slots[i]` is the 0..n_slots-1 month of `geotiff_paths[i]`. Slots with no file stay
+    zero and are reported False in `present`, so the caller can mask them for Presto
+    instead of silently passing a compacted, month-shifted series.
+
+    All months must share the same grid (rslearn guarantees this within one window).
+    Returns (stack, present, transform, crs, height, width).
     """
     # Preallocate and fill in place. The obvious version — collect each month into a list
     # and np.stack() it — holds the list AND the stacked copy live at the same moment, so
@@ -494,19 +581,26 @@ def load_s2_stack(geotiff_paths: list):
     # doubling is tens of GB and gets the job oom-killed by the slurm cgroup. Filling a
     # preallocated array keeps the peak at 1x plus one month's read buffer.
     stack, transform, crs, H, W = None, None, None, None, None
-    for i, p in enumerate(geotiff_paths):
+    present = np.zeros(n_slots, dtype=bool)
+    for p, slot in zip(geotiff_paths, slots):
         with rasterio.open(p) as src:
             if stack is None:
                 transform, crs, H, W = src.transform, src.crs, src.height, src.width
-                stack = np.empty((len(geotiff_paths), src.count, H, W), dtype=np.float32)
+                if n_bands_expected is not None and src.count != n_bands_expected:
+                    raise ValueError(f"{p.name}: expected {n_bands_expected} bands, "
+                                     f"got {src.count}")
+                # Zero-filled: an unmaterialized month reads as 0 reflectance, which
+                # normalizes to 0 and is masked out via `present` anyway.
+                stack = np.zeros((n_slots, src.count, H, W), dtype=np.float32)
             elif (src.height, src.width) != (H, W):
                 raise ValueError(f"Month grid mismatch in {p.name}: "
                                  f"{(src.height, src.width)} vs {(H, W)}")
             elif src.count != stack.shape[1]:
                 raise ValueError(f"Month band-count mismatch in {p.name}: "
                                  f"{src.count} vs {stack.shape[1]}")
-            stack[i] = src.read()          # (bands, H, W), cast to float32 on assignment
-    return stack, transform, crs, H, W
+            stack[slot] = src.read()       # (bands, H, W), cast to float32 on assignment
+            present[slot] = True
+    return stack, present, transform, crs, H, W
 
 
 # ---------------------------------------------------------------------------
@@ -543,18 +637,49 @@ def embed_pixels(
     logger: logging.Logger,
     s1_stack: np.ndarray = None,   # (T, 2, H, W) dB-scale VV/VH, or None for S2-only
     s1_band_names: list = None,    # e.g. PRESTO_S1_BANDS (["VV","VH"])
+    s2_present: np.ndarray = None, # (T,) bool: which timesteps have real S2 (None = all)
+    s1_present: np.ndarray = None, # (T,) bool: same for S1
 ) -> np.ndarray:
     """Run Presto over N pixels -> (N, 128) float32 embeddings.
 
     If s1_stack is given, each pixel's VV/VH time series is fed alongside S2 so Presto's
     S1 channel group is active; otherwise S1 is masked (S2-only) exactly as before.
+
+    Timesteps flagged False in s2_present / s1_present are zero in the stack and are
+    masked out per channel group. This matters because construct_single_presto_input
+    sets mask=0 for EVERY timestep of any band you hand it, so without the override an
+    unmaterialized month would be presented to Presto as a real all-zero observation.
+    S1 and S2 are masked independently, so a month missing from only one of them costs
+    just that channel group.
     """
     import torch
     from presto import construct_single_presto_input
+    # Column layout of the (T, 17) x/mask that construct_single_presto_input returns.
+    from presto.dataops.pipelines.s1_s2_era5_srtm import NORMED_BANDS
 
     N = len(rows)
     out = np.zeros((N, PRESTO_N_CHANNELS), dtype=np.float32)
     month0 = (start_month - 1) % 12  # Presto month index is 0-based (Jan=0)
+    T = s2_stack.shape[0]
+
+    # Build the mask override once — it is identical for every pixel in the tile.
+    normed = list(NORMED_BANDS)
+    s2_cols = [normed.index(b) for b in s2_band_names if b in normed]
+    if "B8" in s2_band_names and "B4" in s2_band_names:
+        # construct_single_presto_input unmasks the derived NDVI when B8 and B4 are
+        # both supplied; a missing month has no NDVI either.
+        s2_cols.append(normed.index("NDVI"))
+    s1_cols = [normed.index(b) for b in (s1_band_names or []) if b in normed]
+
+    mask_override = torch.zeros(T, len(normed))
+    for t in range(T):
+        if s2_present is not None and not s2_present[t]:
+            mask_override[t, s2_cols] = 1.0
+        if s1_stack is not None and s1_present is not None and not s1_present[t]:
+            mask_override[t, s1_cols] = 1.0
+    n_masked = int((mask_override.sum(dim=1) > 0).sum())
+    if n_masked:
+        logger.info("Presto: masking %d/%d timesteps with no imagery", n_masked, T)
 
     # Per-pixel time series: (N, T, n_bands)
     ts = np.transpose(s2_stack[:, :, rows, cols], (2, 0, 1)).astype(np.float32)
@@ -580,7 +705,7 @@ def embed_pixels(
                 kwargs["s1_bands"] = s1_band_names
             x, mask, dw = construct_single_presto_input(**kwargs)
             xs.append(x)
-            masks.append(mask)
+            masks.append(torch.maximum(mask, mask_override))
             dws.append(dw)
         x_b = torch.stack(xs).to(device)
         mask_b = torch.stack(masks).to(device)
@@ -818,37 +943,49 @@ def process_tile(
 
         # 2. Get the monthly S2 stack (rslearn, or pre-materialized imagery).
         if imagery_dir is not None:
-            paths = find_imagery_dir_geotiffs(Path(imagery_dir), healpix_id)
+            paths, slots = find_imagery_dir_geotiffs(Path(imagery_dir), healpix_id)
         else:
             win_dir = materialize_tile_rslearn(
                 healpix_id, lon_min, lat_min, lon_max, lat_max, year,
                 start_month, Path(rslearn_root), logger, workers=rslearn_workers,
                 source=s2_source, with_s1=with_s1)
-            paths = find_monthly_geotiffs(win_dir)
+            paths, slots = find_monthly_geotiffs(win_dir, logger=logger)
         if len(paths) == 0:
             logger.warning(f"Tile {healpix_id}: no S2 monthly imagery found")
             return {"status": "no_imagery", "healpix_id": int(healpix_id)}
-        if len(paths) < PRESTO_NUM_TIMESTEPS:
-            logger.warning("Tile %s: only %d/%d months available; Presto will mask "
-                           "the missing timesteps", healpix_id, len(paths), PRESTO_NUM_TIMESTEPS)
 
-        s2_stack, s2_transform, s2_crs, s2_h, s2_w = load_s2_stack(paths)
-        print(f"  Tile {healpix_id}: S2 stack {s2_stack.shape} ({len(paths)} months)")
+        s2_stack, s2_present, s2_transform, s2_crs, s2_h, s2_w = load_s2_stack(
+            paths, slots, n_bands_expected=len(PRESTO_S2_BANDS))
+        n_s2_months = int(s2_present.sum())
+        if n_s2_months < PRESTO_NUM_TIMESTEPS:
+            logger.warning("Tile %s: only %d/%d months available (slots %s); the rest "
+                           "are masked for Presto", healpix_id, n_s2_months,
+                           PRESTO_NUM_TIMESTEPS,
+                           np.where(~s2_present)[0].tolist())
+        print(f"  Tile {healpix_id}: S2 stack {s2_stack.shape} ({n_s2_months} months)")
 
-        # Optional Sentinel-1: only use it when it has the SAME number of monthly layers
-        # as S2 (so the per-timestep months line up); otherwise fall back to S2-only so
-        # the time series can never silently misalign. S1 shares the S2 window grid, so
-        # the same s2_rows/s2_cols index it. (Not available via --imagery-dir.)
+        # Optional Sentinel-1. S1 is slotted into the same 12-month calendar as S2 by
+        # its own timestamps, so the two can no longer drift apart — a month present in
+        # one and missing from the other just masks that channel group for that month.
+        # S1 shares the S2 window grid, so the same s2_rows/s2_cols index it.
+        # (Not available via --imagery-dir.)
         s1_stack = None
+        s1_present = None
         if with_s1 and imagery_dir is None:
-            s1_paths = find_s1_monthly_geotiffs(win_dir)
-            if len(s1_paths) == s2_stack.shape[0] and len(s1_paths) > 0:
-                s1_raw, _, _, _, _ = load_s2_stack(s1_paths)  # (T, 2, H, W) raw
-                s1_stack = s1_to_presto_db(s1_raw, units=s1_units)
-                print(f"  Tile {healpix_id}: S1 stack {s1_stack.shape} (dB)")
-            elif len(s1_paths) > 0:
-                logger.warning("Tile %s: S1 months (%d) != S2 months (%d); using S2-only",
-                               healpix_id, len(s1_paths), s2_stack.shape[0])
+            s1_paths, s1_slots = find_s1_monthly_geotiffs(win_dir, logger=logger)
+            if len(s1_paths) > 0:
+                s1_raw, s1_present, _, _, s1_h, s1_w = load_s2_stack(
+                    s1_paths, s1_slots, n_bands_expected=len(RSLEARN_S1_BANDS))
+                if (s1_h, s1_w) != (s2_h, s2_w):
+                    # s2_rows/s2_cols index both stacks, so a different grid would read
+                    # the wrong pixels rather than fail.
+                    logger.warning("Tile %s: S1 grid %s != S2 grid %s; using S2-only",
+                                   healpix_id, (s1_h, s1_w), (s2_h, s2_w))
+                    s1_stack, s1_present = None, None
+                else:
+                    s1_stack = s1_to_presto_db(s1_raw, units=s1_units)
+                    print(f"  Tile {healpix_id}: S1 stack {s1_stack.shape} (dB, "
+                          f"{int(s1_present.sum())} months)")
             else:
                 logger.warning("Tile %s: --with-s1 set but no S1 imagery; using S2-only",
                                healpix_id)
@@ -887,7 +1024,8 @@ def process_tile(
             s2_stack, PRESTO_S2_BANDS,
             s2_rows[keep_idx], s2_cols[keep_idx], latlons[keep_idx],
             start_month, encoder, device, batch_size, logger,
-            s1_stack=s1_stack, s1_band_names=PRESTO_S1_BANDS)
+            s1_stack=s1_stack, s1_band_names=PRESTO_S1_BANDS,
+            s2_present=s2_present, s1_present=s1_present)
         logger.info("Tile %s: Presto embedded %d px in %.1fs",
                     healpix_id, len(keep_idx), time.time() - t_emb)
 
@@ -925,7 +1063,7 @@ def process_tile(
             "status": "ok", "healpix_id": int(healpix_id),
             "n_samples": int(len(y)), "n_valid_gedi": int(n_total),
             "coverage_fraction": round(len(keep_idx) / max(1, n_total), 4),
-            "n_channels": int(X.shape[1]), "n_months": len(paths),
+            "n_channels": int(X.shape[1]), "n_months": n_s2_months,
             "elapsed_s": round(elapsed, 1),
         }
 

@@ -320,26 +320,19 @@ def prithvi_predict(dataset_path: Path, model_config: str, prefix: list, logger)
 # Geo helpers
 # ---------------------------------------------------------------------------
 
-def find_olmo_s2_geotiffs(win_dir: Path) -> list:
-    """The (up to 12) monthly sentinel2_l2a geotiffs for a window, in temporal order."""
-    paths = []
-    for i in range(pp.PRESTO_NUM_TIMESTEPS):
-        layer = OLMO_S2_LAYER if i == 0 else f"{OLMO_S2_LAYER}.{i}"
-        p = win_dir / "layers" / layer / OLMO_S2_BANDSET / "geotiff.tif"
-        if p.exists():
-            paths.append(p)
-    return paths
+def find_olmo_s2_geotiffs(win_dir: Path, logger=None) -> tuple:
+    """(paths, slots) for the monthly sentinel2_l2a geotiffs of a window.
+
+    `slots[i]` is the chronological 0..11 month of `paths[i]`. rslearn compacts periods
+    that matched no scene out of the layer numbering, so group index != month on tiles
+    with partial coverage — see pp.read_period_slots.
+    """
+    return pp.find_monthly_geotiffs(win_dir, OLMO_S2_LAYER, OLMO_S2_BANDSET, logger)
 
 
-def find_unified_s1_geotiffs(win_dir: Path) -> list:
-    """The (up to 12) monthly sentinel1 VV/VH geotiffs for a window, temporal order."""
-    paths = []
-    for i in range(pp.PRESTO_NUM_TIMESTEPS):
-        layer = UNIFIED_S1_LAYER if i == 0 else f"{UNIFIED_S1_LAYER}.{i}"
-        p = win_dir / "layers" / layer / UNIFIED_S1_BANDSET / "geotiff.tif"
-        if p.exists():
-            paths.append(p)
-    return paths
+def find_unified_s1_geotiffs(win_dir: Path, logger=None) -> tuple:
+    """(paths, slots) for the monthly sentinel1 VV/VH geotiffs — see find_olmo_s2_geotiffs."""
+    return pp.find_monthly_geotiffs(win_dir, UNIFIED_S1_LAYER, UNIFIED_S1_BANDSET, logger)
 
 
 def find_olmo_embedding_geotiff(win_dir: Path) -> Path:
@@ -403,28 +396,37 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
     count, or a different grid than S2, S1 is skipped for that tile (S2-only) with a
     warning rather than failing.
     """
-    paths = find_olmo_s2_geotiffs(win_dir)
+    paths, slots = find_olmo_s2_geotiffs(win_dir, logger)
     if not paths:
         return None, None, None
-    stack, s2_transform, s2_crs, H, W = pp.load_s2_stack(paths)  # (T, 12, H, W)
-    stack = stack[:, OLMO_TO_PRESTO_BAND_IDX, :, :]              # (T, 10, H, W)
+    # 12-slot stack: each month sits at its own index and missing ones stay empty, so a
+    # period with no scene never shifts the months after it.
+    stack, s2_present, s2_transform, s2_crs, H, W = pp.load_s2_stack(paths, slots)
+    stack = stack[:, OLMO_TO_PRESTO_BAND_IDX, :, :]              # (12, 10, H, W)
     f = PRESTO_DOWNSAMPLE
     transform_30 = s2_transform * Affine.scale(f)               # 10 m -> 30 m pixels
+    if not s2_present.all():
+        logger.warning("S2 missing months %s — masked for Presto",
+                       np.where(~s2_present)[0].tolist())
 
-    # Optional Sentinel-1 stack (dB), aligned to the S2 grid + timesteps.
+    # Optional Sentinel-1 stack (dB). S1 is slotted into the same 12-month calendar by
+    # its own timestamps, so it cannot drift against S2; a month present in only one of
+    # them just masks that channel group for that month.
     s1_full = None
+    s1_present = None
     if with_s1:
-        s1_paths = find_unified_s1_geotiffs(win_dir)
-        if len(s1_paths) != len(paths):
-            logger.warning("S1 has %d monthly geotiffs vs %d for S2 — skipping S1 (S2-only)",
-                           len(s1_paths), len(paths))
+        s1_paths, s1_slots = find_unified_s1_geotiffs(win_dir, logger)
+        if not s1_paths:
+            logger.warning("No S1 monthly geotiffs — skipping S1 (S2-only)")
         else:
-            s1_raw, _, _, s1H, s1W = pp.load_s2_stack(s1_paths)  # (T, 2, H, W)
+            s1_raw, s1_present, _, _, s1H, s1W = pp.load_s2_stack(s1_paths, s1_slots)
             if (s1H, s1W) != (H, W):
                 logger.warning("S1 grid (%d,%d) != S2 (%d,%d) — skipping S1", s1H, s1W, H, W)
+                s1_present = None
             else:
-                s1_full = pp.s1_to_presto_db(s1_raw, units="linear")  # (T, 2, H, W) dB
-                logger.info("Presto: feeding S1 (VV/VH) alongside S2")
+                s1_full = pp.s1_to_presto_db(s1_raw, units="linear")  # (12, 2, H, W) dB
+                logger.info("Presto: feeding S1 (VV/VH) alongside S2 (%d months)",
+                            int(s1_present.sum()))
     s1_bands = pp.PRESTO_S1_BANDS if s1_full is not None else None
 
     if sampling in ("aggregate30", "nearest30"):
@@ -450,7 +452,8 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
             lls = pixel_latlons(rr, cc, transform_30, s2_crs)
             emb = pp.embed_pixels(s2_30, pp.PRESTO_S2_BANDS, rr, cc, lls,
                                   start_month, encoder, device, batch_size, logger,
-                                  s1_stack=s1_30, s1_band_names=s1_bands)
+                                  s1_stack=s1_30, s1_band_names=s1_bands,
+                                  s2_present=s2_present, s1_present=s1_present)
             emb_30[r0 * W30:r1 * W30] = emb
         emb_30 = emb_30.reshape(H30, W30, pp.PRESTO_N_CHANNELS).transpose(2, 0, 1)
         return emb_30, transform_30, s2_crs
@@ -472,7 +475,8 @@ def presto_dense_30m(win_dir: Path, start_month: int, sampling: str,
         lls = pixel_latlons(rr, cc, s2_transform, s2_crs)
         emb = pp.embed_pixels(stack, pp.PRESTO_S2_BANDS, rr, cc, lls,
                               start_month, encoder, device, batch_size, logger,
-                              s1_stack=s1_10, s1_band_names=s1_bands)
+                              s1_stack=s1_10, s1_band_names=s1_bands,
+                              s2_present=s2_present, s1_present=s1_present)
         r30, c30 = rr // f, cc // f
         np.add.at(acc, (r30, c30), emb)
         np.add.at(cnt, (r30, c30), 1)
