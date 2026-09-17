@@ -50,7 +50,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from metrics_stratified import stratified_metrics, overall_metrics  # noqa: E402
+from metrics_stratified import (stratified_metrics, overall_metrics,
+                                t975)  # noqa: E402
 
 # Categorical slots 1..8 in fixed order, never cycled. Used only by the per-bin
 # line figure (adjacent pairlist). A 9th source would fold into "Other" rather
@@ -113,6 +114,47 @@ def per_bin_series(y_true, y_pred, bin_size, max_height, min_bin_n):
     bias = np.array([b.get("bias") if b["rmse"] is not None else np.nan
                      for b in s["bins"]], dtype=float)
     return c, rmse, bias, s
+
+
+def per_seed_bins(src_dir, split, bin_size, max_height, min_bin_n, interval):
+    """Per-bin RMSE and bias aggregated ACROSS SEEDS.
+
+    Returns (centres, rmse_mean, rmse_err, bias_mean, bias_err, n_seeds).
+
+    Computed per seed and then averaged — NOT from the seed-mean parquet. The
+    ensemble would have better-than-real per-bin RMSE and no interval at all.
+    """
+    paths = sorted(src_dir.glob(f"seed_*/predictions_{split}.parquet"))
+    if not paths:
+        return None
+    centres, rmses, biases = None, [], []
+    for p in paths:
+        df = pd.read_parquet(p, columns=["y_true", "y_pred"])
+        st = stratified_metrics(df["y_true"].to_numpy(), df["y_pred"].to_numpy(),
+                                bin_size=bin_size, max_height=max_height,
+                                min_bin_n=min_bin_n)
+        if centres is None:
+            centres = np.array([(b["lo"] + b["hi"]) / 2 for b in st["bins"]])
+        rmses.append([b["rmse"] if b["rmse"] is not None else np.nan
+                      for b in st["bins"]])
+        biases.append([b.get("bias") if b["rmse"] is not None else np.nan
+                       for b in st["bins"]])
+    R = np.array(rmses, float)
+    B = np.array(biases, float)
+    n = len(paths)
+
+    def agg(M):
+        mean = np.nanmean(M, axis=0)
+        if n < 2:
+            return mean, np.zeros(M.shape[1])
+        sd = np.nanstd(M, axis=0, ddof=1)
+        # Interval on the MEAN: t(0.975, n-1)*s/sqrt(n). At n=5, t=2.776.
+        err = sd if interval == "std" else t975(n - 1) * sd / np.sqrt(n)
+        return mean, err
+
+    rm, re_ = agg(R)
+    bm, be = agg(B)
+    return centres, rm, re_, bm, be, n
 
 
 def point_density(x, y, hi, nbins):
@@ -300,18 +342,21 @@ def figure_bins(results, args, out_path):
     style_axes(ax1)
     style_axes(ax2)
 
+    n_src = len(results)
+    # Small x-dodge so the error bars of adjacent series do not overlap.
+    step = (args.bin_size * 0.30) / max(n_src, 1)
+    offs = (np.arange(n_src) - (n_src - 1) / 2) * step
+
     for i, (src, r) in enumerate(results):
         colour = SERIES[i % len(SERIES)]
-        c, rmse, bias, _s = r["bins"]
         label = LABELS.get(src, src)
-        ax1.plot(c, rmse, color=colour, linewidth=2.0, marker="o",
-                 markersize=8, markerfacecolor=colour,
-                 markeredgecolor="white", markeredgewidth=2.0,
-                 label=label, zorder=3)
-        ax2.plot(c, bias, color=colour, linewidth=2.0, marker="o",
-                 markersize=8, markerfacecolor=colour,
-                 markeredgecolor="white", markeredgewidth=2.0,
-                 label=label, zorder=3)
+        c, rmse, rmse_err, bias, bias_err, n_seeds = r["seed_bins"]
+        common = dict(color=colour, linewidth=2.0, marker="o", markersize=8,
+                      markerfacecolor=colour, markeredgecolor="white",
+                      markeredgewidth=2.0, elinewidth=1.4, capsize=3,
+                      capthick=1.4, zorder=3)
+        ax1.errorbar(c + offs[i], rmse, yerr=rmse_err, label=label, **common)
+        ax2.errorbar(c + offs[i], bias, yerr=bias_err, label=label, **common)
 
     ax2.axhline(0, color=INK_MUTED, linewidth=1.5, linestyle=(0, (5, 4)), zorder=2)
     # Headroom so the 8px markers at the extremes are not clipped by the spines.
@@ -327,8 +372,9 @@ def figure_bins(results, args, out_path):
     for t in leg.get_texts():
         t.set_color(INK_2)
 
-    ax1.set_title("Error by canopy-height class", color=INK, fontsize=13,
-                  fontweight="600", loc="left", pad=10)
+    bars = "95% CI" if args.interval == "ci95" else "±1 s.d."
+    ax1.set_title(f"Error by canopy-height class  ({bars} over seeds)",
+                  color=INK, fontsize=13, fontweight="600", loc="left", pad=10)
     fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"wrote {out_path}")
@@ -347,6 +393,10 @@ def main():
     ap.add_argument("--bin-size", type=float, default=10.0)
     ap.add_argument("--max-height", type=float, default=60.0)
     ap.add_argument("--min-bin-n", type=int, default=100)
+    ap.add_argument("--interval", default="ci95", choices=["ci95", "std"],
+                    help="error bars in the per-bin figure: 'ci95' (default) = "
+                         "two-sided 95%% CI of the mean across seeds, "
+                         "t(0.975, n-1)*s/sqrt(n); 'std' = sample std")
     ap.add_argument("--overall-fit", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="dashed least-squares fit over the whole range")
@@ -404,8 +454,11 @@ def main():
         yt, yp = df["y_true"].to_numpy(), df["y_pred"].to_numpy()
         c, rmse, bias, s = per_bin_series(yt, yp, args.bin_size,
                                           args.max_height, args.min_bin_n)
+        seed_bins = per_seed_bins(d, args.split, args.bin_size, args.max_height,
+                                  args.min_bin_n, args.interval)
         results.append((d.name, {
             "df": df, "n_seeds": n_seeds, "bins": (c, rmse, bias, s),
+            "seed_bins": seed_bins,
             "overall": overall_metrics(yt, yp), "strat": s,
         }))
         m = results[-1][1]["overall"]

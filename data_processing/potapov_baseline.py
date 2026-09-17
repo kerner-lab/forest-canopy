@@ -33,6 +33,7 @@ Then run, e.g.:
 
 import argparse
 import io
+import json
 import os
 import sys
 import time
@@ -49,6 +50,11 @@ from rasterio.warp import reproject, Resampling
 import requests
 
 import ee
+
+# Same metric code the RF runs use, so baseline and model numbers are computed
+# identically. This file lives in data_processing/, hence the parent on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from metrics_stratified import evaluate_and_report  # noqa: E402
 
 # Potapov GEDI_V27 native grid: EPSG:4326, 0.00025 deg (~28 m), aligned to the
 # global grid where every pixel edge is an integer multiple of NATIVE_RES.
@@ -180,8 +186,14 @@ def download_tile(img, transform, width, height, bounds, crs_epsg=4326, retries=
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--ee-project', required=True,
-                    help='Google Cloud project registered for Earth Engine.')
+    ap.add_argument('--ee-project', default=None,
+                    help='Google Cloud project registered for Earth Engine. Only '
+                         'needed if some tile is NOT already cached in '
+                         '<out-dir>/potapov_tiles/ — Earth Engine is initialised '
+                         'lazily, on the first tile that actually needs a download.')
+    ap.add_argument('--cache-only', action='store_true',
+                    help='Never contact Earth Engine: skip any tile without a cached '
+                         'potapov tif instead of downloading it.')
     ap.add_argument('--shapefile',
                     default='/Users/kdoerkse/Documents/ASU/JPL/data/shapefiles/healpix_shapefile.shp')
     ap.add_argument('--gedi-dir',
@@ -192,6 +204,20 @@ def main():
     ap.add_argument('--collection-id', default='users/potapovpeter/GEDI_V27')
     ap.add_argument('--tile-id-column', default='healpix_id')
     ap.add_argument('--gedi-nodata', type=float, default=-9999.0)
+    # Keep these identical to the RF runs or the stratified numbers are not
+    # comparable (run_gedi_prediction_30m.py uses the same defaults).
+    ap.add_argument('--metric-bin-size', type=float, default=10.0,
+                    help='Height bin width in m for stratified metrics (default: 10)')
+    ap.add_argument('--metric-max-height', type=float, default=60.0,
+                    help='Top bin edge in m; taller pixels fall in the last bin')
+    ap.add_argument('--metric-min-bin-n', type=int, default=100,
+                    help='Bins smaller than this are excluded from the summaries')
+    ap.add_argument('--metric-balance-seed', type=int, default=42,
+                    help='Seed for the bin-balancing resample (default: 42)')
+    ap.add_argument('--tile-list', default=None, metavar='PATH',
+                    help='File of healpix ids (one per line) restricting the run to '
+                         'those tiles. Use the master intersection list so the '
+                         'baseline is evaluated on exactly the tiles the models were.')
     ap.add_argument('--max-tiles', type=int, default=None,
                     help='Optional cap on number of tiles (for quick tests).')
     ap.add_argument('--overwrite', action='store_true',
@@ -202,11 +228,34 @@ def main():
     tiles_dir = out_dir / 'potapov_tiles'
     tiles_dir.mkdir(parents=True, exist_ok=True)
 
-    init_ee(args.ee_project)
-    potapov = build_potapov_image(args.collection_id)
+    # Earth Engine is initialised on demand so a fully-cached run needs no
+    # credentials and no network at all.
+    ee_state = {'img': None}
+
+    def get_potapov():
+        if ee_state['img'] is None:
+            if not args.ee_project:
+                sys.exit("ERROR: a tile needs downloading but --ee-project was not "
+                         "given. Pass it, or use --cache-only to skip uncached tiles.")
+            init_ee(args.ee_project)
+            ee_state['img'] = build_potapov_image(args.collection_id)
+        return ee_state['img']
 
     gdf = gpd.read_file(args.shapefile)
     test_ids = gdf[gdf['split'] == args.split][args.tile_id_column].tolist()
+    if args.tile_list:
+        keep = {int(t) for t in Path(args.tile_list).read_text().split()
+                if t.strip() and not t.strip().startswith('#')}
+        before = len(test_ids)
+        test_ids = [t for t in test_ids if int(t) in keep]
+        missing = sorted(keep - {int(t) for t in test_ids})
+        print(f"Tile list: {len(test_ids)}/{before} '{args.split}' tiles kept "
+              f"({args.tile_list})")
+        if missing:
+            print(f"  WARNING: {len(missing)} id(s) in the list are not in this "
+                  f"split: {missing}")
+        if not test_ids:
+            sys.exit("ERROR: tile list removed every tile.")
     if args.max_tiles:
         test_ids = test_ids[:args.max_tiles]
     print(f"{len(test_ids)} '{args.split}' tiles to process.")
@@ -240,10 +289,15 @@ def main():
             with rasterio.open(pot_tif) as psrc:
                 pot = psrc.read(1).astype(np.float32)
             src_note = 'cached'
+        elif args.cache_only:
+            print(f"[{i+1}/{len(test_ids)}] tile {hid}: no cached tif and "
+                  f"--cache-only -- skip")
+            skipped.append(hid)
+            continue
         else:
             print(f"[{i+1}/{len(test_ids)}] tile {hid}: downloading Potapov "
                   f"({width}x{height}, {n_valid} valid GEDI px)...")
-            pot = download_tile(potapov, transform, width, height, bounds)
+            pot = download_tile(get_potapov(), transform, width, height, bounds)
             profile.update(dtype='float32', count=1, nodata=0, compress='lzw')
             with rasterio.open(pot_tif, 'w', **profile) as dst:
                 dst.write(pot.astype(np.float32), 1)
@@ -279,23 +333,37 @@ def main():
     nozero_path = out_dir / 'predictions_test_nozero.parquet'
     nozero.to_parquet(nozero_path, index=False, compression='snappy')
 
-    def _stats(df):
-        yt, yp = df['y_true'].values, df['y_pred'].values
-        rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
-        r = float(np.corrcoef(yt, yp)[0, 1]) if len(yt) > 1 else float('nan')
-        return rmse, r
-
-    rmse_all, r_all = _stats(full)
-    rmse_nz, r_nz = _stats(nozero)
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 78)
     print("POTAPOV 2019 BASELINE vs GEDI (test tiles)")
-    print("=" * 60)
-    print(f"tiles used: {len(rows)}  skipped: {len(skipped)}")
-    print(f"all valid GEDI px   : n={len(full):>8}  RMSE={rmse_all:6.3f} m  r={r_all:.3f}")
-    print(f"baseline 0 dropped  : n={len(nozero):>8}  RMSE={rmse_nz:6.3f} m  r={r_nz:.3f}")
+    print("=" * 78)
+    print(f"tiles used: {len(rows)}  skipped: {len(skipped)}\n")
+
+    kw = dict(bin_size=args.metric_bin_size, max_height=args.metric_max_height,
+              min_bin_n=args.metric_min_bin_n, balance_seed=args.metric_balance_seed)
+    metrics = {
+        'baseline': 'potapov_2019',
+        'split': args.split,
+        'n_tiles_used': len(rows),
+        'n_tiles_skipped': len(skipped),
+        'metric_bin_size': args.metric_bin_size,
+        'metric_max_height': args.metric_max_height,
+        'all_valid': evaluate_and_report(
+            full['y_true'].values, full['y_pred'].values, 'all valid GEDI px', **kw),
+    }
+    print()
+    metrics['baseline_zero_dropped'] = evaluate_and_report(
+        nozero['y_true'].values, nozero['y_pred'].values, 'baseline 0 dropped', **kw)
+
+    metrics_path = out_dir / 'metrics.json'
+    metrics_path.write_text(json.dumps(metrics, indent=2))
+
     print(f"\nwrote {full_path}")
     print(f"wrote {nozero_path}")
+    print(f"wrote {metrics_path}")
     print(f"potapov tiles cached in {tiles_dir}")
+    print("\nNOTE: R2 is the number comparable to the RF models; Pearson r is shown\n"
+          "      alongside it because r ignores bias and scale, so a systematically\n"
+          "      short baseline can post a high r and a negative R2.")
 
 
 if __name__ == '__main__':
