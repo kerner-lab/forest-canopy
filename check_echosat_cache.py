@@ -50,10 +50,18 @@ BASE_YEAR = 2018
 SENTINEL = -9999.0
 MGRS_BANDS = "CDEFGHJKLMNPQRSTUVWX"
 
-# Plausible canopy-height envelope in metres. ECHOSAT is a height product, so
-# anything outside this is a unit error (cm leaking through) or corruption.
-MIN_PLAUSIBLE_M = 0.0
+# Plausible canopy-height envelope in metres.
+#
+# MIN is NOT 0: ECHOSAT is a regression output, so it emits slightly negative
+# heights over bare ground and water (observed down to -0.51 m across the 2020 test
+# split). A 0.0 floor flagged two perfectly healthy tiles as "unit error?". The real
+# unit-error signature is the MAXIMUM -- centimetres leaking through would put it
+# near 12000, not the minimum a fraction below zero.
+MIN_PLAUSIBLE_M = -5.0
 MAX_PLAUSIBLE_M = 150.0
+# Separately, a large share of negative pixels would mean something is actually
+# wrong, even if none of them is individually extreme.
+MAX_NEGATIVE_FRAC = 0.05
 
 
 def mgrs_latband(lat):
@@ -145,6 +153,11 @@ def check_tile(hid, tiles_dir, gedi_dir, deep, gedi_nodata=-9999.0,
                 if v.min() < MIN_PLAUSIBLE_M or v.max() > MAX_PLAUSIBLE_M:
                     problems.append(f'values out of range [{v.min():.1f}, '
                                     f'{v.max():.1f}] m -- unit error?')
+                neg_frac = float((v < 0).mean())
+                info['neg_frac'] = round(neg_frac, 5)
+                if neg_frac > MAX_NEGATIVE_FRAC:
+                    problems.append(f'{neg_frac:.1%} of pixels are negative '
+                                    f'(min {v.min():.2f} m)')
                 # A band that never varies means the source window was empty or
                 # the write went wrong; heights are never uniform over a tile.
                 for b in range(stack.shape[0]):
