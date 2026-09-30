@@ -14,11 +14,9 @@ Embeddings compared:
 |---|---|---|---|
 | AlphaEarth (AEF) | 64 | precomputed archive, dequantized int8 → float32 | `data_processing/alphaearth_processing.py` |
 | TESSERA | 128 | precomputed archive (GeoTessera blocks) | `data_processing/tessera_processing.py` |
-| Major TOM | 2048 | precomputed archive (Core-S2L1C-SSL4EO) | `data_processing/majortom_processing.py` |
 | OlmoEarth | 128 | model run via rslearn | `olmoearth_download.py`, `data_processing/unified_embedding_pipeline.py` |
 | Presto | 128 | model run locally on monthly S2 (+S1) time series | `data_processing/presto_processing.py` |
 | Prithvi-EO-2.0 | 1024 | model run via rslearn | `data_processing/unified_embedding_pipeline.py` |
-| Clay v1.5 | 1024 | model run locally, reuses the Presto imagery | `data_processing/clay_processing.py` |
 
 Baselines compared:
 
@@ -31,7 +29,7 @@ Baselines compared:
 
 ---
 
-## Conventions that hold everywhere
+## Constants between methods
 
 Read this before anything else — most of the pipeline's constraints follow from it.
 
@@ -99,7 +97,7 @@ the low bins. See [Stage 5](#stage-5--metrics).
 
 ---
 
-## Stage 0 — Build the tile grid and GEDI targets
+## Stage 0: Build the tile grid and GEDI targets
 
 One-time setup. Everything downstream keys off these two artefacts.
 
@@ -118,7 +116,7 @@ python data_processing/tile_gedi_with_healpix.py \
 
 ---
 
-## Stage 1 — Generate or query the embeddings
+## Stage 1: Generate or query the embeddings
 
 Two families, same output format.
 
@@ -138,9 +136,6 @@ python data_processing/alphaearth_processing.py \
 python data_processing/tessera_processing.py \
     --healpix-id 12345 --year 2020 \
     --shapefile ... --gedi-dir ... --output-dir ... --cache-dir /scratch/tessera_cache
-
-# Major TOM — 2048-d; --list-years first to see what the archive holds
-python data_processing/majortom_processing.py --list-years
 ```
 
 ### 1b. Models run over imagery (fetch S2, then encode)
@@ -162,9 +157,6 @@ python data_processing/unified_embedding_pipeline.py \
     --olmo-model-config /path/model-gpu.yaml \
     --output-dir /path/embeddings/2020 --emit-xy --do-prithvi
 
-# Clay v1.5 — reuses the Presto rslearn plumbing so the two are apples-to-apples
-python data_processing/clay_processing.py --healpix-id 12345 --year 2020 ...
-
 # OlmoEarth predictions from the hosted API
 python olmoearth_download.py --help
 ```
@@ -177,19 +169,7 @@ Useful flags on the model-based scripts:
 - `--check-only` — report cache coverage and exit
 - `--save-tif` — also write a georeferenced embedding GeoTIFF for QGIS
 
-**HPC wrappers.** The array jobs that drive these at scale, one tile per array index:
-
-| Wrapper | Runs |
-|---|---|
-| `run_presto_embed_sol.sh` | Presto (ASU Sol) |
-| `run_prithvi_embed_sol.sh`, `run_prithvi_embed_bridges.sh` | unified OLMo/Prithvi/Presto |
-| `run_tessera_embed.sh` | TESSERA |
-| `run_echosat_baseline.sh` | ECHOSAT baseline cache |
-| `run_make_xy.sh` | rebuild `xy` npz from dense npz |
-
-Array index → `healpix_id` is a 1-based line number in `tile_ids.txt`.
-
-### 1c. Repair and rescue
+### 1c. Repair if needed
 
 Things that go wrong at scale, and the script for each:
 
@@ -232,11 +212,11 @@ script for the same answer without the deep validation.
 
 ---
 
-## Stage 3 — Align the tiles, then verify the pixels
+## Stage 3: Align the tiles and verify the pixels
 
-Two separate checks. Do them in this order.
+Two separate checks; check the intersection of the tiles which have embeddings, then check pixel-to-pixel overlap.
 
-### 3a. Master tile list — TILE-level intersection
+### 3a. Create master tile list -> TILE-level intersection
 
 **`build_master_tile_list.py`** — the tiles that *every* source actually has. Without
 this, each encoder is scored on whatever it happens to have on disk, which confounds
@@ -259,7 +239,7 @@ python build_master_tile_list.py \
 intersection to a subset of sources. Output is the per-split id lists that every later
 stage passes as `--tile-list`.
 
-### 3b. Pixel alignment — the check that tile agreement does *not* give you
+### 3b. Pixel alignment -> check the overlap per-pixel in shared tiles 
 
 **`count_measurements.py`** — verifies the sources sampled the **same pixels**, by
 comparing the `y` vectors (identical GEDI labels ⇒ identical pixels).
@@ -341,7 +321,7 @@ Outputs, all in `--output-dir`:
 
 ---
 
-## Stage 5 — Metrics
+## Stage 5: Calculate Metrics
 
 ### Why stratified
 
@@ -446,14 +426,8 @@ Applying a fitted model to every pixel rather than only GEDI pixels:
 
 ---
 
-## Environments
+## Environment Notes
 
-Two conda environments are used, because the GFM dependencies conflict:
-
-- **`jpl`** — RF training, metrics, plotting (sklearn, geopandas, rasterio, pyarrow)
-- **`jpl-geo`** — embedding generation (adds rslearn, torch, presto, GDAL ≥ 3.10)
-
-Notes that will bite otherwise:
 
 - **Presto** must be installed from source with `pip install -e . --no-deps` plus
   openmapflow guards; the PyPI package is not equivalent.
@@ -495,30 +469,7 @@ numbers from it, cite the upstream sources:
 - **Potapov et al. 2019** — GEDI-derived forest height
 - **Meta/WRI CHM v2** — Brandt et al. 2026
 - **Presto** — Tseng et al. (nasaharvest/presto)
-- **Clay**, **Prithvi-EO-2.0**, **OlmoEarth**, **TESSERA**, **AlphaEarth**, **Major TOM** — see each project
+- **Prithvi-EO-2.0**, **OlmoEarth**, **TESSERA**, **AlphaEarth** — see each project
 - **GEDI L2A/L2B** — NASA GEDI mission
 
 ---
-
-## TODO before open-sourcing
-
-Known gaps, in rough priority order:
-
-- [ ] **Add a `LICENSE`** — there is none, so the repo is currently "all rights
-      reserved" and nobody can legally reuse it.
-- [ ] **Add `environment.yml` / `requirements.txt`** — the two environments are
-      described above but not reproducible from the repo.
-- [ ] **Add a `.gitignore`** and untrack the committed `__pycache__/`, `*.pyc` and
-      `.DS_Store` files.
-- [ ] **Remove hardcoded absolute paths.** Several scripts default to
-      `/Users/kdoerkse/...`, `/scratch/kdoerkse/...` or `/ocean/projects/...`, and
-      `data_processing/eth_canopy_baseline.py` defaults `--ee-project` to a personal
-      GCP project.
-      Make them required arguments or read them from a config file.
-- [ ] **Remove or clearly mark scratch files** — `scratch.py`, `benchmark_acquisition.py`,
-      and the `qa_*` / `dequant_check_*` one-offs.
-- [ ] **Hoist the GEDI validity rule** (`> 0`, `< 12000`) into one shared module; it is
-      currently duplicated in five files where it must not diverge.
-- [ ] Add a small end-to-end smoke test on one tile so contributors can verify a setup.
-- [ ] Document how to obtain the HEALPix shapefile and GEDI mosaics, or ship a tiny
-      example tile — right now Stage 0 cannot be reproduced from the repo alone.
