@@ -2,8 +2,8 @@
 """
 Process Presto embeddings per healpix tile, with imagery fetched for free via rslearn.
 
-This is the Presto analogue of tessera_processing.py / alphaearth_processing.py /
-majortom_processing.py. It produces the exact same output format —
+This is the Presto analogue of tessera_processing.py / alphaearth_processing.py.
+ It produces the exact same output format —
 healpix_{id}_float32.npz containing (X, y) — so the output directory can be passed
 straight to run_gedi_prediction_30m.py via --preprocessed-dir --embedding-format float32.
 
@@ -12,13 +12,7 @@ straight to run_gedi_prediction_30m.py via --preprocessed-dir --embedding-format
   rslearn: https://github.com/allenai/rslearn  (free Sentinel-2 via
           rslearn.data_sources.gcp_public_data.Sentinel2 — no Earth Engine account)
 
-Why "for free"
---------------
-rslearn pulls Sentinel-2 L1C straight from the public GCP/AWS open-data buckets, so
-there is no paid Earth Engine / commercial API in the loop. Presto itself is a tiny
-(<1M param) pretrained transformer that runs on CPU.
-
-How Presto differs from TESSERA / Alpha Earth / Major TOM
+How Presto differs from TESSERA / Alpha Earth
 ---------------------------------------------------------
 Presto is NOT a precomputed embedding archive — it is a *model* you run yourself.
 It consumes a PER-PIXEL monthly TIME SERIES (Presto's native input: 12 monthly
@@ -121,7 +115,7 @@ PRESTO_S1_BANDS = ["VV", "VH"]  # names construct_single_presto_input expects
 
 
 # ---------------------------------------------------------------------------
-# Tile bounds (shared with the TESSERA / Alpha Earth / Major TOM scripts)
+# Tile bounds (shared with the TESSERA / Alpha Earth scripts)
 # ---------------------------------------------------------------------------
 
 def get_tile_bounds(healpix_id: int, gdf: gpd.GeoDataFrame) -> tuple:
@@ -177,7 +171,7 @@ def subset_tiles_for_split(tiles: np.ndarray, fraction: float, seed: int) -> np.
 
 
 # ---------------------------------------------------------------------------
-# rslearn: fetch a 12-month Sentinel-2 stack for a tile (free, no Earth Engine)
+# rslearn: fetch a 12-month Sentinel-2 stack for a tile
 # ---------------------------------------------------------------------------
 
 def write_rslearn_config(root: Path, source: str = "pc", with_s1: bool = False) -> Path:
@@ -188,14 +182,6 @@ def write_rslearn_config(root: Path, source: str = "pc", with_s1: bool = False) 
     The window's 12-month time range (set by `add_windows --start/--end`) is split into
     PRESTO_NUM_TIMESTEPS 30-day sub-periods via period_duration="30d" + max_matches=12,
     yielding 12 monthly composites materialized as sentinel2, sentinel2.1, ... sentinel2.11.
-
-    NOTE on the "no S2 monthly imagery found" failures (~1/3 of tiles): the real fix was
-    init_args.sort_by="eo:cloud_cover" — without it, cloudy / sparse-revisit tiles matched no
-    usable scene and materialized nothing, while the OLMo rslearn dataset (which sets sort_by)
-    pulled S2 over the exact same regions. space_mode="MOSAIC" WITH period_duration builds one
-    mosaic per 30-day period (the 12 monthly layer groups this pipeline expects); it is the
-    modern equivalent of the deprecated PER_PERIOD_MOSAIC, so use MOSAIC to avoid the rslearn
-    deprecation warning.
 
     NOTE on durations: rslearn parses these strings with pytimeparse, which reads "M" as
     MINUTES, not months ("1M" -> 60s, "12M" -> 12min). Use day units ("30d"). Also do NOT
@@ -213,9 +199,7 @@ def write_rslearn_config(root: Path, source: str = "pc", with_s1: bool = False) 
     query_config = {
         # MOSAIC + period_duration = one mosaic per 30-day period -> 12 monthly layer
         # groups. (This is the modern equivalent of the now-deprecated PER_PERIOD_MOSAIC;
-        # rslearn warns "Use SpaceMode.MOSAIC with period_duration instead".) The real fix
-        # for the "no S2 monthly imagery" failures was sort_by=eo:cloud_cover in init_args,
-        # not the space_mode.
+        # rslearn warns "Use SpaceMode.MOSAIC with period_duration instead".)
         "space_mode": "MOSAIC",
         "max_matches": PRESTO_NUM_TIMESTEPS,
         "period_duration": "30d",  # ~1 month; pytimeparse has no month unit
@@ -275,8 +259,7 @@ def write_rslearn_config(root: Path, source: str = "pc", with_s1: bool = False) 
     if with_s1:
         # Sentinel-1 VV/VH from Planetary Computer (IW mode, dual-pol), 12 monthly
         # mosaics on the same chronological schedule as S2 (same query_config, so the
-        # per_period_mosaic_reverse_time_order=False fix applies to S1 too). Mirrors the
-        # OLMo S1 layer. PC has no anonymous element84 S1, so this is always PC.
+        # per_period_mosaic_reverse_time_order=False fix applies to S1 too).
         layers[RSLEARN_S1_LAYER] = {
             "type": "raster",
             "band_sets": [
@@ -424,7 +407,7 @@ def read_period_slots(win_dir: Path, layer_name: str, logger: logging.Logger = N
     """
     Map each materialized layer-group index -> its chronological slot (0..n_slots-1).
 
-    WHY THIS EXISTS: rslearn drops periods that matched no scene instead of leaving a
+    rslearn drops periods that matched no scene instead of leaving a
     hole — in data_sources/utils.py the per-period loop does `if period_groups:
     groups.append(...)`. So on a tile where (say) February had no usable scene you get
     11 groups numbered sentinel2, sentinel2.1 ... sentinel2.10 with the gap compacted
