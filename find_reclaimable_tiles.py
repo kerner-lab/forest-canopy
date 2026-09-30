@@ -5,7 +5,7 @@ embeddings have already been generated.
 
 Cross-references three locations:
     <out>/prithvi_xy/healpix_<id>_float32.npz   Prithvi (X,y)
-    <out>/healpix_<id>_presto.npz               Presto dense
+    <out>/healpix_<id>_float32.npz               Presto (X,y))
     <rslearn>/healpix_<id>/                     materialized Sentinel-2 (the space hog)
 
 A tile is reported as RECLAIMABLE only when both embedding files exist. Anything missing
@@ -78,6 +78,7 @@ def main():
     out_dir = Path(args.out_dir) if args.out_dir else Path(args.base) / args.year / "out"
     rslearn_dir = Path(args.rslearn_dir) if args.rslearn_dir else Path(args.base) / args.year / "rslearn"
     prithvi_dir = out_dir / "prithvi_xy"
+    presto_dir = out_dir / "presto_xy"
 
     for label, p in (("out", out_dir), ("rslearn", rslearn_dir)):
         if not p.is_dir():
@@ -89,7 +90,7 @@ def main():
         from check_missing_embeddings import validate_npz as validate
 
     print(f"prithvi_xy : {prithvi_dir}")
-    print(f"presto     : {out_dir}/healpix_<id>_presto.npz")
+    print(f"presto     : {presto_dir}/healpix_<id>_float32.npz")
     print(f"rslearn    : {rslearn_dir}")
     print(f"validate   : {'ON (opening every npz)' if args.validate else 'OFF (existence only)'}\n")
 
@@ -110,7 +111,7 @@ def main():
         print(f"[{i}/{n}] healpix_{tid} ...", end="", file=sys.stderr, flush=True)
         reasons = []
         for label, path in (("prithvi", prithvi_dir / f"healpix_{tid}_float32.npz"),
-                            ("presto", out_dir / f"healpix_{tid}_presto.npz")):
+                            ("presto", out_dir / f"healpix_{tid}_float32.npz")):
             if not path.exists():
                 reasons.append(f"{label} missing")
             elif validate is not None:
