@@ -5,7 +5,7 @@ embeddings have already been generated.
 
 Cross-references three locations:
     <out>/prithvi_xy/healpix_<id>_float32.npz   Prithvi (X,y)
-    <out>/healpix_<id>_float32.npz               Presto (X,y))
+    <out>/presto_xy/healpix_<id>_float32.npz     Presto (X,y)
     <rslearn>/healpix_<id>/                     materialized Sentinel-2 (the space hog)
 
 A tile is reported as RECLAIMABLE only when both embedding files exist. Anything missing
@@ -111,7 +111,7 @@ def main():
         print(f"[{i}/{n}] healpix_{tid} ...", end="", file=sys.stderr, flush=True)
         reasons = []
         for label, path in (("prithvi", prithvi_dir / f"healpix_{tid}_float32.npz"),
-                            ("presto", out_dir / f"healpix_{tid}_float32.npz")):
+                            ("presto", presto_dir / f"healpix_{tid}_float32.npz")):
             if not path.exists():
                 reasons.append(f"{label} missing")
             elif validate is not None:

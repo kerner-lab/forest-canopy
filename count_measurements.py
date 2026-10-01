@@ -245,8 +245,15 @@ def main():
                           f"tolerance (worst {100*biggest:.2f}%)")
                     continue
                 clean = False
+                # Report the tolerated worst here too: these are the tiles that stay in
+                # the aligned set, so their gap is what the manuscript has to quote. The
+                # excluded tiles below are gone and their percentages do not matter.
+                soft_note = ""
+                if soft:
+                    soft_note = (f", worst retained "
+                                 f"{100*max(m['frac'] for m in soft):.2f}%")
                 print(f"  {split:<8} {name:<10} {len(hard)} tile(s) EXCEED tolerance "
-                      f"({len(soft)} within it):")
+                      f"({len(soft)} within it{soft_note}):")
                 for m in hard[:args.max_report]:
                     if m["reason"] == "length":
                         print(f"      tile {m['tile']}: {m['n']} px vs "
