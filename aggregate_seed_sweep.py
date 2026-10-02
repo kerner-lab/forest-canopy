@@ -10,10 +10,32 @@ Bias is mean(pred - true) in metres: positive = the model over-predicts height.
 Runs written before bias was recorded in metrics.json get it computed from the
 predictions_<split>.parquet saved next to their metrics.json (see fill_bias()).
 
+Seed-averaged predictions (--out-dir)
+-------------------------------------
+With --out-dir, also writes per source
+
+    <out-dir>/<source>/predictions_<split>.parquet   y_true, y_pred (mean over seeds),
+                                                     y_pred_std (across seeds)
+
+in the same row order as the per-seed files, so it drops straight into
+data_processing/reconstruct_predictions_to_raster.py --parquet ... and from there
+plot_track_comparison.py. Averaging is row-by-row, which is only valid when every
+seed predicted the same pixels in the same order; the test rows depend on
+subset_seed / stratified_sample_seed, not random_state, so a random_state sweep
+lines up. That is CHECKED, not assumed: y_true must be identical across seeds or the
+source is skipped.
+
+Note the averaged prediction is an ensemble: its RMSE is typically LOWER than the
+mean of the per-seed RMSEs in the table. Its own metrics are recorded in
+<out-dir>/manifest.json; quote the table's mean +/- CI for per-model performance.
+
 Usage:
     python aggregate_seed_sweep.py --root outputs_seed_sweep_2019
     python aggregate_seed_sweep.py --root outputs_seed_sweep_2019 --split test
     python aggregate_seed_sweep.py --root outputs_seed_sweep_2019 --csv summary.csv
+
+    # table CSV + seed-averaged parquets in one folder, ready to scp
+    python aggregate_seed_sweep.py --root outputs_seed_sweep_2019 --out-dir seed_avg_2019
 """
 
 import argparse
@@ -24,6 +46,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from metrics_stratified import mean_ci95, stratified_metrics  # noqa: E402
@@ -92,7 +116,6 @@ def fill_bias(block, seed, seed_dir: Path, split):
     pq = seed_dir / f"predictions_{split}.parquet"
     if not pq.is_file():
         return f"no {pq.name}, bias unavailable"
-    import pandas as pd
     df = pd.read_parquet(pq, columns=["y_true", "y_pred"])
     yt = df["y_true"].to_numpy(np.float64)
     yp = df["y_pred"].to_numpy(np.float64)
@@ -138,12 +161,65 @@ def fmt_cell(cols, m):
     return f"{mean:{sign}.3f} +/- {half:.3f}"
 
 
+def average_predictions(per_seed, split):
+    """Row-wise mean/std of y_pred over seeds. Returns (df, seeds, note).
+
+    df is None (with the reason in note) when a seed lacks its parquet or the seeds
+    do not share y_true row-for-row — averaging misaligned rows would silently mix
+    different pixels.
+    """
+    seeds, y_true, preds = [], None, []
+    for seed in sorted(per_seed):
+        _d, seed_dir = per_seed[seed]
+        pq = seed_dir / f"predictions_{split}.parquet"
+        if not pq.is_file():
+            return None, seeds, f"seed {seed} has no {pq.name}"
+        df = pd.read_parquet(pq, columns=["y_true", "y_pred"])
+        yt = df["y_true"].to_numpy(np.float32)
+        if y_true is None:
+            y_true = yt
+        elif len(yt) != len(y_true) or not np.array_equal(yt, y_true):
+            n = f"{len(yt):,} vs {len(y_true):,} rows" if len(yt) != len(y_true) \
+                else "same length, different y_true"
+            return None, seeds, (f"seed {seed} rows do not match seed {seeds[0]} ({n}) — "
+                                 f"seeds sampled different pixels, cannot average")
+        preds.append(df["y_pred"].to_numpy(np.float64))
+        seeds.append(seed)
+    P = np.vstack(preds)                                   # (n_seeds, N)
+    out = pd.DataFrame({
+        "y_true": y_true,
+        "y_pred": P.mean(axis=0).astype(np.float32),
+        "y_pred_std": (P.std(axis=0, ddof=1) if len(seeds) > 1
+                       else np.zeros(P.shape[1])).astype(np.float32),
+    })
+    return out, seeds, None
+
+
+def write_summary_csv(path, rows, split):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["source", "split", "n_seeds"]
+                   + [c for m in METRICS + STRAT_METRICS
+                      for c in (f"{m}_mean", f"{m}_std", f"{m}_ci95")])
+        for source, n_seeds, cols in rows:
+            out = [source, split, n_seeds]
+            for m in METRICS + STRAT_METRICS:
+                mean, std, half = cols[m]
+                out += [f"{mean:.6f}", f"{std:.6f}", f"{half:.6f}"]
+            w.writerow(out)
+    print(f"Wrote {path}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", required=True, help="sweep root (OUT_ROOT from run_seed_sweep.sh)")
     ap.add_argument("--split", default="test", choices=["train", "val", "test"])
     ap.add_argument("--csv", default=None, help="also write the table here")
+    ap.add_argument("--out-dir", default=None, metavar="DIR",
+                    help="write the table CSV (summary_<split>.csv, unless --csv is "
+                         "given) and per-source seed-averaged predictions_<split>.parquet "
+                         "+ manifest.json here — one folder to scp")
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -216,19 +292,44 @@ def main():
               "means are not over the same number of runs: "
               + ", ".join(f"{s}={n}" for s, n in incomplete) + "\n")
 
-    if args.csv:
-        with open(args.csv, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["source", "split", "n_seeds"]
-                       + [c for m in METRICS + STRAT_METRICS
-                          for c in (f"{m}_mean", f"{m}_std", f"{m}_ci95")])
-            for source, n_seeds, cols in rows:
-                out = [source, args.split, n_seeds]
-                for m in METRICS + STRAT_METRICS:
-                    mean, std, half = cols[m]
-                    out += [f"{mean:.6f}", f"{std:.6f}", f"{half:.6f}"]
-                w.writerow(out)
-        print(f"Wrote {args.csv}")
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = args.csv or (out_dir / f"summary_{args.split}.csv" if out_dir else None)
+    if csv_path:
+        write_summary_csv(csv_path, rows, args.split)
+
+    if out_dir:
+        print(f"\nSeed-averaged predictions ({args.split}) -> {out_dir}")
+        manifest = {"root": str(root.resolve()), "split": args.split, "sources": {}}
+        for source in sorted(runs):
+            df, seeds, note = average_predictions(runs[source], args.split)
+            if df is None:
+                print(f"  {source:<10} SKIPPED — {note}")
+                manifest["sources"][source] = {"skipped": note}
+                continue
+            dst = out_dir / source / f"predictions_{args.split}.parquet"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(dst, index=False, compression="snappy")
+            yt = df["y_true"].to_numpy(np.float64)
+            yp = df["y_pred"].to_numpy(np.float64)
+            ens = {"rmse": float(np.sqrt(mean_squared_error(yt, yp))),
+                   "mae": float(mean_absolute_error(yt, yp)),
+                   "r2": float(r2_score(yt, yp)),
+                   "bias": float(np.mean(yp - yt))}
+            manifest["sources"][source] = {
+                "seeds": [str(s) for s in seeds], "n_rows": int(len(df)),
+                "parquet": str(dst.relative_to(out_dir)),
+                "ensemble_metrics": ens,
+                "median_pred_std_m": float(np.median(df["y_pred_std"])),
+            }
+            print(f"  {source:<10} {len(seeds)} seeds, {len(df):,} rows  "
+                  f"ensemble RMSE={ens['rmse']:.3f} bias={ens['bias']:+.3f}  "
+                  f"median seed-to-seed std={np.median(df['y_pred_std']):.3f} m  -> {dst}")
+        (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        print(f"  manifest -> {out_dir / 'manifest.json'}")
+        print("\n  Ensemble metrics are of the AVERAGED prediction and are usually better\n"
+              "  than the per-seed mean in the table — quote the table for performance.")
 
 
 if __name__ == "__main__":

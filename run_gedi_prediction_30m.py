@@ -359,10 +359,6 @@ class GEDIPredictor30m:
             print(f"  {msg}")
             self.logger.info(msg)
             if len(tiles) == 0:
-                # Fatal for train (nothing to fit), but an empty val/test is a
-                # legitimate configuration — e.g. a master list built from the
-                # train+test splits only. evaluate() returns None for those and
-                # main() already skips missing metrics.
                 if split_name == 'train':
                     raise ValueError(
                         f"Tile allowlist removed every tile from split '{split_name}'. "
@@ -558,10 +554,12 @@ class GEDIPredictor30m:
             'rmse': float(np.sqrt(mean_squared_error(y_train, y_pred))),
             'mae': float(mean_absolute_error(y_train, y_pred)),
             'r2': float(r2_score(y_train, y_pred)),
+            'bias': float(np.mean(y_pred - y_train)),
             'n_samples': int(len(y_train)),
         }
         metrics['stratified'] = self._stratified_metrics(y_train, y_pred)
-        print(f"Train  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}")
+        print(f"Train  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}  "
+              f"bias={metrics['bias']:+.3f}")
         self._report_stratified(metrics, 'train')
         self.logger.info(f"Train metrics: {metrics}")
         self._save_predictions(y_train, y_pred, 'train')
@@ -621,10 +619,12 @@ class GEDIPredictor30m:
             'rmse': float(np.sqrt(mean_squared_error(y, y_pred))),
             'mae': float(mean_absolute_error(y, y_pred)),
             'r2': float(r2_score(y, y_pred)),
+            'bias': float(np.mean(y_pred - y)),
             'n_samples': int(len(y)),
         }
         metrics['stratified'] = self._stratified_metrics(y, y_pred)
-        print(f"{split_name.capitalize()}  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}")
+        print(f"{split_name.capitalize()}  RMSE={metrics['rmse']:.3f}  MAE={metrics['mae']:.3f}  R²={metrics['r2']:.3f}  "
+              f"bias={metrics['bias']:+.3f}")
         self._report_stratified(metrics, split_name)
         self.logger.info(f"'{split_name}' metrics: {metrics}")
 
