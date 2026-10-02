@@ -94,6 +94,7 @@ def stratified_metrics(y_true, y_pred, bin_size=10.0, max_height=60.0,
             'balanced_rmse': float(np.sqrt(mean_squared_error(yt, yp))),
             'balanced_mae': float(mean_absolute_error(yt, yp)),
             'balanced_r2': float(r2_score(yt, yp)),
+            'balanced_bias': float(np.mean(yp - yt)),
         })
     return out
 

@@ -4,7 +4,11 @@ Aggregate a multi-seed sweep into mean +/- std per embedding source.
 
 Reads every  <root>/<source>/seed_<n>/metrics.json  written by
 run_gedi_prediction_30m.py (via run_seed_sweep.sh) and reports, per source and
-split, the mean and sample standard deviation (ddof=1) of RMSE, MAE and R^2.
+split, the mean and sample standard deviation (ddof=1) of RMSE, MAE, R^2 and bias.
+
+Bias is mean(pred - true) in metres: positive = the model over-predicts height.
+Runs written before bias was recorded in metrics.json get it computed from the
+predictions_<split>.parquet saved next to their metrics.json (see fill_bias()).
 
 Usage:
     python aggregate_seed_sweep.py --root outputs_seed_sweep_2019
@@ -19,17 +23,29 @@ import statistics
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from metrics_stratified import mean_ci95  # noqa: E402
+import numpy as np
 
-METRICS = ("rmse", "mae", "r2")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from metrics_stratified import mean_ci95, stratified_metrics  # noqa: E402
+
+METRICS = ("rmse", "mae", "r2", "bias")
 
 # Stratified summaries, read from metrics["<split>"]["stratified"].
 # macro_*    = unweighted mean over height bins (every height class counts equally)
 # balanced_* = ordinary metrics on a bin-balanced subsample
 # macro_r2 is deliberately NOT included: within-bin R^2 is range-restricted and
 # collapses toward 0 regardless of model quality. Use balanced_r2 instead.
-STRAT_METRICS = ("macro_rmse", "macro_mae", "balanced_rmse", "balanced_r2")
+# There is no macro bias either: per-bin biases are signed and cancel (short canopy
+# over-predicted, tall under-predicted), so their mean reads near 0 for a model
+# that is badly biased in every bin. balanced_bias has no such cancellation.
+STRAT_METRICS = ("macro_rmse", "macro_mae", "balanced_rmse", "balanced_r2",
+                 "balanced_bias")
+
+# Tolerance for accepting a balanced_bias recomputed from the parquet: the
+# recomputed balanced_rmse must match the stored one this closely (metres). The
+# parquet holds float32 predictions, so an identical subsample still differs by
+# ~1e-6 m; a different subsample differs by centimetres or more.
+BALANCED_MATCH_ATOL = 1e-3
 
 
 def load_runs(root: Path):
@@ -45,8 +61,58 @@ def load_runs(root: Path):
         # Prefer the recorded seed over the directory name — the directory is only
         # a convention, the json is what the run actually used.
         seed = d.get("random_state", mpath.parent.name.replace("seed_", ""))
-        runs.setdefault(source, {})[seed] = d
+        runs.setdefault(source, {})[seed] = (d, mpath.parent)
     return runs
+
+
+def split_block(d, split):
+    """The metrics dict for `split` (train metrics may be nested one level deeper)."""
+    block = d.get(split) or {}
+    if split == "train" and "train" in block:
+        block = block["train"]
+    return block
+
+
+def fill_bias(block, seed, seed_dir: Path, split):
+    """Add bias / balanced_bias to `block` from predictions_<split>.parquet if absent.
+
+    Returns a short note when something could not be filled, else None.
+
+    bias is exact (the parquet is the same y_true/y_pred the metrics came from).
+    balanced_bias needs the same bin-balanced subsample the run drew, so it is
+    recomputed with the run's seed and bins and accepted ONLY if the recomputed
+    balanced_rmse reproduces the stored one — proof the subsample is identical
+    (min_bin_n is not recorded in metrics.json; this check catches a non-default).
+    """
+    strat = block.get("stratified") or {}
+    need_bias = block.get("bias") is None
+    need_bal = strat.get("balanced_rmse") is not None and strat.get("balanced_bias") is None
+    if not (need_bias or need_bal):
+        return None
+    pq = seed_dir / f"predictions_{split}.parquet"
+    if not pq.is_file():
+        return f"no {pq.name}, bias unavailable"
+    import pandas as pd
+    df = pd.read_parquet(pq, columns=["y_true", "y_pred"])
+    yt = df["y_true"].to_numpy(np.float64)
+    yp = df["y_pred"].to_numpy(np.float64)
+    if need_bias:
+        block["bias"] = float(np.mean(yp - yt))
+    if need_bal:
+        bins = strat.get("bins") or []
+        try:
+            balance_seed = int(seed)
+        except (TypeError, ValueError):
+            return "seed not an int, balanced_bias unavailable"
+        re = stratified_metrics(yt, yp, bin_size=strat["bin_size"],
+                                max_height=bins[-1]["hi"] if bins else 60.0,
+                                balance_seed=balance_seed)
+        if (re.get("balanced_rmse") is not None
+                and abs(re["balanced_rmse"] - strat["balanced_rmse"]) <= BALANCED_MATCH_ATOL):
+            strat["balanced_bias"] = re["balanced_bias"]
+        else:
+            return "could not reproduce the balanced subsample, balanced_bias unavailable"
+    return None
 
 
 def summarize(values):
@@ -61,6 +127,15 @@ def summarize(values):
         return values[0], 0.0, 0.0
     mean, half, _n = mean_ci95(values)
     return mean, statistics.stdev(values), half
+
+
+def fmt_cell(cols, m):
+    """'mean +/- ci' for metric m, signed for bias, 'n/a' when no seed reported it."""
+    if cols[f"n_{m}"] == 0:
+        return "n/a"
+    mean, _std, half = cols[m]
+    sign = "+" if m.endswith("bias") else ""
+    return f"{mean:{sign}.3f} +/- {half:.3f}"
 
 
 def main():
@@ -82,14 +157,20 @@ def main():
     rows = []
     for source in sorted(runs):
         per_seed = runs[source]
+        blocks = {}
+        for seed in sorted(per_seed):
+            d, seed_dir = per_seed[seed]
+            block = split_block(d, args.split)
+            if block:
+                note = fill_bias(block, seed, seed_dir, args.split)
+                if note:
+                    print(f"NOTE: {source} seed {seed}: {note}")
+            blocks[seed] = block
         cols = {}
         for m in METRICS + STRAT_METRICS:
             vals = []
-            for seed in sorted(per_seed):
-                block = per_seed[seed].get(args.split) or {}
-                # train metrics are nested one level deeper in the saved json
-                if args.split == "train" and "train" in block:
-                    block = block["train"]
+            for seed in sorted(blocks):
+                block = blocks[seed]
                 # stratified summaries live under the "stratified" sub-dict
                 src = block.get("stratified") or {} if m in STRAT_METRICS else block
                 if src.get(m) is not None:
@@ -101,28 +182,24 @@ def main():
     n_label = f"{args.split} split"
     print(f"\n{n_label}: mean +/- 95% CI of the mean over seeds "
           f"(t(0.975, n-1))\n")
-    print(f"{'source':<10} {'n':>3}  {'RMSE (m)':>16} {'MAE (m)':>16} {'R2':>16}")
-    print("-" * 68)
+    print(f"{'source':<10} {'n':>3}  {'RMSE (m)':>16} {'MAE (m)':>16} {'R2':>16} "
+          f"{'bias (m)':>17}")
+    print("-" * 86)
     for source, n_seeds, cols in rows:
-        cells = []
-        for m in METRICS:
-            mean, _std, half = cols[m]
-            cells.append(f"{mean:.3f} +/- {half:.3f}")
-        print(f"{source:<10} {n_seeds:>3}  {cells[0]:>16} {cells[1]:>16} {cells[2]:>16}")
-    print()
+        cells = [fmt_cell(cols, m) for m in METRICS]
+        print(f"{source:<10} {n_seeds:>3}  {cells[0]:>16} {cells[1]:>16} {cells[2]:>16} "
+              f"{cells[3]:>17}")
+    print("\n  bias = mean(pred - true); positive = over-predicts canopy height.\n")
 
     if any(cols[f"n_{m}"] for _s, _n, cols in rows for m in STRAT_METRICS):
         print(f"{n_label}: STRATIFIED over height bins\n")
         print(f"{'source':<10} {'n':>3}  {'macro RMSE':>16} {'macro MAE':>16} "
-              f"{'bal. RMSE':>16} {'bal. R2':>16}")
-        print("-" * 86)
+              f"{'bal. RMSE':>16} {'bal. R2':>16} {'bal. bias':>17}")
+        print("-" * 104)
         for source, n_seeds, cols in rows:
-            cells = []
-            for m in STRAT_METRICS:
-                mean, _std, half = cols[m]
-                cells.append("n/a" if cols[f"n_{m}"] == 0
-                             else f"{mean:.3f} +/- {half:.3f}")
-            print(f"{source:<10} {n_seeds:>3}  " + " ".join(f"{c:>16}" for c in cells))
+            cells = [fmt_cell(cols, m) for m in STRAT_METRICS]
+            print(f"{source:<10} {n_seeds:>3}  "
+                  + " ".join(f"{c:>16}" for c in cells[:-1]) + f" {cells[-1]:>17}")
         print("\n  macro_*    = unweighted mean over height bins; every height class counts\n"
               "               equally, so tall-canopy error is no longer drowned out by the\n"
               "               short-canopy pixels that dominate the overall number.\n"
