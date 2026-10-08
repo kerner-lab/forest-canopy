@@ -62,6 +62,8 @@ from rasterio.transform import array_bounds
 from shapely.geometry import box
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib
+import matplotlib.pyplot as plt
 
 try:
     from tqdm import tqdm
@@ -285,9 +287,7 @@ def predict_wall_to_wall(rf, aoi_tif, output_tif, n_features, block_rows,
 # ---------------------------------------------------------------------------
 
 def plot_prediction(output_tif, output_plot, cmap, vmin, vmax, title):
-    import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
 
     with rasterio.open(output_tif) as src:
         arr = src.read(1)

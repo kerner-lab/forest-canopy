@@ -36,6 +36,20 @@ Usage:
 
     # table CSV + seed-averaged parquets in one folder, ready to scp
     python aggregate_seed_sweep.py --root outputs_seed_sweep_2019 --out-dir seed_avg_2019
+
+    # add baselines as extra rows (single run each, so no CI)
+    python aggregate_seed_sweep.py --root outputs_seed_sweep_2020 \
+        --baseline echosat=/ocean/.../echosat/test_2020/metrics.json \
+        --baseline eth=/ocean/.../eth_baseline_2020/metrics.json
+
+Baselines (--baseline NAME=PATH[:BLOCK])
+---------------------------------------
+Baseline metrics.json files (echosat_baseline.py / potapov_baseline.py /
+eth_canopy_baseline.py) hold several result blocks, e.g. ECHOSAT 'echosat_valid'
+and 'masked_filled_zero'. Without :BLOCK the block with the LARGEST n_samples is
+used: that is the one keeping every valid GEDI pixel (nodata filled, not dropped),
+i.e. the same pixel set the GFMs are scored on. A warning is printed if its n
+differs from the GFMs' test n.
 """
 
 import argparse
@@ -97,7 +111,7 @@ def split_block(d, split):
     return block
 
 
-def fill_bias(block, seed, seed_dir: Path, split):
+def fill_bias(block, seed, seed_dir: Path, split, pq: Path = None):
     """Add bias / balanced_bias to `block` from predictions_<split>.parquet if absent.
 
     Returns a short note when something could not be filled, else None.
@@ -113,7 +127,7 @@ def fill_bias(block, seed, seed_dir: Path, split):
     need_bal = strat.get("balanced_rmse") is not None and strat.get("balanced_bias") is None
     if not (need_bias or need_bal):
         return None
-    pq = seed_dir / f"predictions_{split}.parquet"
+    pq = pq or seed_dir / f"predictions_{split}.parquet"
     if not pq.is_file():
         return f"no {pq.name}, bias unavailable"
     df = pd.read_parquet(pq, columns=["y_true", "y_pred"])
@@ -158,7 +172,47 @@ def fmt_cell(cols, m):
         return "n/a"
     mean, _std, half = cols[m]
     sign = "+" if m.endswith("bias") else ""
+    if cols[f"n_{m}"] == 1:          # single run (a baseline): no CI to show
+        return f"{mean:{sign}.3f}"
     return f"{mean:{sign}.3f} +/- {half:.3f}"
+
+
+def load_baseline(name, spec, split):
+    """(row, note) for one --baseline NAME=PATH[:BLOCK]; row shaped like a model row."""
+    path, _, block_name = spec.partition(":")
+    path = Path(path)
+    if path.is_dir():
+        path = path / "metrics.json"
+    d = json.loads(path.read_text())
+    blocks = {k: v for k, v in d.items()
+              if isinstance(v, dict) and "rmse" in v and "stratified" in v}
+    if not blocks:
+        raise SystemExit(f"ERROR: --baseline {name}: no result blocks in {path}")
+    if block_name:
+        if block_name not in blocks:
+            raise SystemExit(f"ERROR: --baseline {name}: no block '{block_name}' in "
+                             f"{path} (have: {', '.join(blocks)})")
+    else:
+        block_name = max(blocks, key=lambda k: blocks[k].get("n_samples", 0))
+    block = blocks[block_name]
+    # Baselines predate balanced_bias. Recover it from whichever of the baseline's
+    # parquets reproduces this block's balanced_rmse (fill_bias verifies that).
+    note = None
+    if (block["stratified"].get("balanced_rmse") is not None
+            and block["stratified"].get("balanced_bias") is None):
+        note = "no parquet reproduces this block, balanced_bias unavailable"
+        for pq in sorted(path.parent.glob(f"predictions_{split}*.parquet")):
+            if fill_bias(block, d.get("metric_balance_seed", 42), path.parent,
+                         split, pq=pq) is None:
+                note = None
+                break
+    cols = {}
+    for m in METRICS + STRAT_METRICS:
+        src = block["stratified"] if m in STRAT_METRICS else block
+        v = src.get(m)
+        cols[m] = summarize([float(v)] if v is not None else [])
+        cols[f"n_{m}"] = int(v is not None)
+    return (name, block_name, int(block.get("n_samples", 0)), cols), note
 
 
 def average_predictions(per_seed, split):
@@ -195,18 +249,26 @@ def average_predictions(per_seed, split):
     return out, seeds, None
 
 
-def write_summary_csv(path, rows, split):
+def write_summary_csv(path, rows, split, base_rows=()):
+    """Model rows, then baseline rows (kind=baseline; std/ci left blank)."""
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["source", "split", "n_seeds"]
                    + [c for m in METRICS + STRAT_METRICS
-                      for c in (f"{m}_mean", f"{m}_std", f"{m}_ci95")])
+                      for c in (f"{m}_mean", f"{m}_std", f"{m}_ci95")]
+                   + ["kind", "baseline_block"])
         for source, n_seeds, cols in rows:
             out = [source, split, n_seeds]
             for m in METRICS + STRAT_METRICS:
                 mean, std, half = cols[m]
                 out += [f"{mean:.6f}", f"{std:.6f}", f"{half:.6f}"]
-            w.writerow(out)
+            w.writerow(out + ["model", ""])
+        for name, block_name, _n, cols in base_rows:
+            out = [name, split, 1]
+            for m in METRICS + STRAT_METRICS:
+                mean, _std, _half = cols[m]
+                out += [f"{mean:.6f}" if cols[f"n_{m}"] else "", "", ""]
+            w.writerow(out + ["baseline", block_name])
     print(f"Wrote {path}")
 
 
@@ -220,6 +282,10 @@ def main():
                     help="write the table CSV (summary_<split>.csv, unless --csv is "
                          "given) and per-source seed-averaged predictions_<split>.parquet "
                          "+ manifest.json here — one folder to scp")
+    ap.add_argument("--baseline", action="append", default=[], metavar="NAME=PATH[:BLOCK]",
+                    help="add a baseline row from its metrics.json (or its directory). "
+                         "BLOCK defaults to the block with the most pixels (every valid "
+                         "GEDI pixel, nodata filled). Repeat per baseline.")
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -255,6 +321,25 @@ def main():
             cols[f"n_{m}"] = len(vals)
         rows.append((source, len(per_seed), cols))
 
+    # GFM test pixel count, to check each baseline is scored on the same pixels.
+    gfm_n = {int(split_block(d, args.split).get("n_samples", -1))
+             for per_seed in runs.values() for d, _dir in per_seed.values()
+             if split_block(d, args.split).get("n_samples") is not None}
+    base_rows = []
+    for spec in args.baseline:
+        name, sep, rest = spec.partition("=")
+        if not sep:
+            raise SystemExit(f"ERROR: --baseline expects NAME=PATH[:BLOCK], got {spec!r}")
+        row, note = load_baseline(name, rest, args.split)
+        base_rows.append(row)
+        print(f"baseline {name}: block '{row[1]}' (n={row[2]:,})")
+        if note:
+            print(f"NOTE: baseline {name}: {note}")
+        if gfm_n and row[2] not in gfm_n:
+            print(f"WARNING: baseline {name} n={row[2]:,} but the GFMs' {args.split} n is "
+                  f"{', '.join(f'{n:,}' for n in sorted(gfm_n))} — NOT the same pixels "
+                  f"(check tile list, GEDI year, and the block).")
+
     n_label = f"{args.split} split"
     print(f"\n{n_label}: mean +/- 95% CI of the mean over seeds "
           f"(t(0.975, n-1))\n")
@@ -265,6 +350,12 @@ def main():
         cells = [fmt_cell(cols, m) for m in METRICS]
         print(f"{source:<10} {n_seeds:>3}  {cells[0]:>16} {cells[1]:>16} {cells[2]:>16} "
               f"{cells[3]:>17}")
+    if base_rows:
+        print("-" * 86)
+        for name, _b, _n, cols in base_rows:
+            cells = [fmt_cell(cols, m) for m in METRICS]
+            print(f"{name:<10} {'-':>3}  {cells[0]:>16} {cells[1]:>16} {cells[2]:>16} "
+                  f"{cells[3]:>17}")
     print("\n  bias = mean(pred - true); positive = over-predicts canopy height.\n")
 
     if any(cols[f"n_{m}"] for _s, _n, cols in rows for m in STRAT_METRICS):
@@ -276,6 +367,12 @@ def main():
             cells = [fmt_cell(cols, m) for m in STRAT_METRICS]
             print(f"{source:<10} {n_seeds:>3}  "
                   + " ".join(f"{c:>16}" for c in cells[:-1]) + f" {cells[-1]:>17}")
+        if base_rows:
+            print("-" * 104)
+            for name, _b, _n, cols in base_rows:
+                cells = [fmt_cell(cols, m) for m in STRAT_METRICS]
+                print(f"{name:<10} {'-':>3}  "
+                      + " ".join(f"{c:>16}" for c in cells[:-1]) + f" {cells[-1]:>17}")
         print("\n  macro_*    = unweighted mean over height bins; every height class counts\n"
               "               equally, so tall-canopy error is no longer drowned out by the\n"
               "               short-canopy pixels that dominate the overall number.\n"
@@ -297,7 +394,7 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = args.csv or (out_dir / f"summary_{args.split}.csv" if out_dir else None)
     if csv_path:
-        write_summary_csv(csv_path, rows, args.split)
+        write_summary_csv(csv_path, rows, args.split, base_rows)
 
     if out_dir:
         print(f"\nSeed-averaged predictions ({args.split}) -> {out_dir}")

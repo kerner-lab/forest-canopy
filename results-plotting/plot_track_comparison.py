@@ -12,8 +12,12 @@ panel.
 
 Predictions are read from per-tile rasters ALREADY on the GEDI grid (same CRS /
 transform / shape), so they are sampled at the track pixels directly. The
-baselines produced by potapov_baseline.py and eth_canopy_baseline.py are exactly
-such rasters.
+baselines produced by potapov_baseline.py, eth_canopy_baseline.py and
+echosat_baseline.py are exactly such rasters.
+
+Multi-year rasters (ECHOSAT's cached tiles hold 2018-2024 as 7 bands, each band
+described by its year) are sampled at the band whose description equals --year,
+so the baseline year always matches the GEDI epoch being plotted.
 
 Track extraction:
   - valid GEDI pixels (gedi != nodata, 0 < gedi < 12000 cm) are clustered with
@@ -58,32 +62,49 @@ DEFAULT_PRED_ROOT = "/Users/kdoerkse/Documents/ASU/JPL/data"
 # grid -- every raster here is already on the GEDI grid. Worth keeping visible,
 # since spatial support differs by ~50x across these encoders.
 DEFAULT_MODELS = [
-    ("OlmoEarth RF (40m)",
+    ("OlmoEarth",
      "{root}/olmo_pred_rasters/{year}/healpix_{gid}_olmo.tif",
      "#d1495b", -9999.0),
-    ("AlphaEarth RF (10m)",
+    ("AlphaEarth",
      "{root}/aef_pred_rasters/healpix_{gid}_aef.tif",
      "#7b3fb0", -9999.0),
-    ("TESSERA RF (10m)",
+    ("TESSERA",
      "{root}/tessera_pred_rasters/{year}/healpix_{gid}_tessera.tif",
      "#1f6fb4", -9999.0),
-    ("Presto RF (10m)",
+    ("Presto",
      "{root}/presto_pred_rasters/{year}/healpix_{gid}_presto.tif",
      "#e08214", -9999.0),
-    ("Prithvi RF (30m)",
+    ("Prithvi",
      "{root}/prithvi_pred_rasters/{year}/healpix_{gid}_prithvi.tif",
      "#2a9d8f", -9999.0),
-    # Baseline last => bottom panel.
-    ("Potapov (30m)",
+    # Baselines last => bottom panels.
+    # ECHOSAT: 7-band cache from echosat_baseline.py; the --year band is picked
+    # by its description (see load_raster_on_gedi_grid).
+    ("ECHOSAT",
+     "{root}/echosat/echosat_tiles/healpix_{gid}_echosat.tif",
+     "#8c564b", -9999.0),
+    ("Potapov",
      "{root}/potapov_baseline_{year}/potapov_tiles/healpix_{gid}_potapov.tif",
      "#6c757d", 0.0),
 ]
 
 
-def load_raster_on_gedi_grid(path, ref_shape):
-    """Read a single-band raster and confirm it matches the GEDI grid shape."""
+def load_raster_on_gedi_grid(path, ref_shape, year):
+    """Read a raster on the GEDI grid; for multi-band rasters take the `year` band.
+
+    A multi-band raster must label its bands with years (echosat_baseline.py sets
+    the descriptions to '2018'..'2024'). Picking by description, never by a fixed
+    index, means a wrong year cannot slip into the figure silently.
+    """
     with rasterio.open(path) as s:
-        arr = s.read(1).astype(np.float64)
+        band = 1
+        if s.count > 1:
+            descs = list(s.descriptions)
+            if str(year) not in descs:
+                raise ValueError(f"{path}: {s.count} bands described {descs}, "
+                                 f"none is {year}")
+            band = descs.index(str(year)) + 1
+        arr = s.read(band).astype(np.float64)
         nod = s.nodata
     if arr.shape != ref_shape:
         raise ValueError(f"{path}: shape {arr.shape} != GEDI grid {ref_shape}")
@@ -155,6 +176,10 @@ def main():
     ap.add_argument("--min-len-m", type=float, default=300.0)
     ap.add_argument("--track-rank", type=int, default=0,
                     help="Which track to plot: 0 = best (most points), 1 = next, ...")
+    ap.add_argument("--near", type=float, nargs=2, default=None, metavar=("LAT", "LON"),
+                    help="Plot the track passing closest to this point (WGS84 lat lon) "
+                         "instead of picking by --track-rank. The GEDI tile must be in "
+                         "EPSG:4326 (the HEALPix tiles are).")
     ap.add_argument("--model", action="append", default=None, metavar="SPEC",
                     help="Model panel spec 'label|path_template|color|nodata' "
                          "({gid} is filled with the healpix id). Repeat for each "
@@ -177,6 +202,7 @@ def main():
         gedi = s.read(1).astype(np.float64)
         transform = s.transform
         nod = s.nodata if s.nodata is not None else GEDI_NODATA
+        gedi_epsg = s.crs.to_epsg() if s.crs else None
     ref_shape = gedi.shape
 
     valid = (gedi != nod) & (gedi > 0) & (gedi < GEDI_MAX_CM)
@@ -195,6 +221,22 @@ def main():
         print(f"  rank {i}: len={d['length_m']:6.0f}m  n={d['n']:3d}  "
               f"width={d['width_m']:3.0f}m  aspect={d['aspect']:5.0f}  "
               f"GEDI H[{h.min():4.1f},{h.max():4.1f}] range={h.max()-h.min():4.1f}m")
+    if args.near is not None:
+        if gedi_epsg != 4326:
+            raise SystemExit(f"--near needs an EPSG:4326 GEDI tile, got EPSG:{gedi_epsg}")
+        lat, lon = args.near
+        col_f, row_f = ~transform * (lon, lat)
+        if not (0 <= row_f < ref_shape[0] and 0 <= col_f < ref_shape[1]):
+            raise SystemExit(f"--near {lat} {lon} is outside tile {gid}")
+        # Same pixel-to-metre mapping the tracks were clustered in, so the
+        # distance is in metres and comparable across tracks.
+        pt = metric_coords(np.array([row_f]), np.array([col_f]), transform,
+                           ref_shape[0])[0]
+        dists = [float(np.min(np.hypot(*(xy_m[d["idx"]] - pt).T))) for d in tracks]
+        args.track_rank = int(np.argmin(dists))
+        print(f"--near {lat} {lon}: closest track is rank {args.track_rank}, "
+              f"{dists[args.track_rank]:.0f} m away (next closest "
+              f"{sorted(dists)[1]:.0f} m)" if len(dists) > 1 else "")
     if args.track_rank >= len(tracks):
         raise SystemExit(f"--track-rank {args.track_rank} out of range "
                          f"(only {len(tracks)} tracks)")
@@ -208,7 +250,8 @@ def main():
     trk_rows, trk_cols = rows[sel], cols[sel]
     gedi_m = gedi[trk_rows, trk_cols] / 100.0   # cm -> m
     print(f"selected track rank {args.track_rank}: {len(t)} shots over "
-          f"{t.max():.0f} m; GEDI height {gedi_m.min():.1f}-{gedi_m.max():.1f} m")
+          f"{t.max():.0f} m (width {tr['width_m']:.0f} m); "
+          f"GEDI height {gedi_m.min():.1f}-{gedi_m.max():.1f} m")
 
     # Model panels: from --model specs if given, else DEFAULT_MODELS.
     if args.model:
@@ -227,7 +270,7 @@ def main():
             print(f"  skip {label}: raster not found ({p})")
             missing.append(label)
             continue
-        arr, rnod = load_raster_on_gedi_grid(p, ref_shape)
+        arr, rnod = load_raster_on_gedi_grid(p, ref_shape, args.year)
         vals = arr[trk_rows, trk_cols]
         mask = np.isfinite(vals)
         for nd in (mnod, rnod):
@@ -254,7 +297,7 @@ def main():
 
     out = Path(args.out) if args.out else Path(f"track_comparison_{gid}.png")
     ymax = np.nanmax([gedi_m.max()] +
-                     [np.nanmax(y) for _, _, y, n, _, _ in model_series if n]) * 1.1
+                     [np.nanmax(y) for _, _, y, n, _, _ in model_series if n]) * 1.25   # headroom so the panel labels never cover the profile
 
     n_panels = len(model_series)
     fig, axes = plt.subplots(n_panels, 1, figsize=(10, 2.1 * n_panels + 0.5),

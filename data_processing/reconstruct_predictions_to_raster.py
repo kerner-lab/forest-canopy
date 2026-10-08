@@ -138,6 +138,12 @@ def main():
                     help="Embedding cache dir (healpix_<id>_float32.npz). With --align, "
                          "pins each tile's row count exactly so the alignment cannot "
                          "run past a tile boundary.")
+    ap.add_argument("--tile-list", default=None, metavar="PATH",
+                    help="healpix ids (one per line) the run was restricted to, i.e. the "
+                         "--tile-list given to run_gedi_prediction_30m.py. Limits the "
+                         "retrace to those tiles; needed with --align when no complete "
+                         "--cache-dir is available, or alignment can spill rows into "
+                         "tiles the run never saw.")
     ap.add_argument("--tile", type=int, default=None,
                     help="Only write this healpix id (still auto-detects year on full split)")
     args = ap.parse_args()
@@ -149,6 +155,11 @@ def main():
 
     gdf = gpd.read_file(args.shapefile)
     tile_ids = gdf[gdf["split"] == args.split]["healpix_id"].values
+    if args.tile_list:
+        # Same filter as run_gedi_prediction_30m.py: keep shapefile order.
+        keep = {int(t) for t in Path(args.tile_list).read_text().split()
+                if t.strip() and not t.strip().startswith("#")}
+        tile_ids = np.array([t for t in tile_ids if int(t) in keep])
     print(f"{len(tile_ids)} '{args.split}' tiles in shapefile order")
 
     gedi_dirs = find_gedi_dirs(args.gedi_base, args.years)

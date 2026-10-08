@@ -1,0 +1,113 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Notebooks
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# ---------------------------------------------------------------------------
+# OS / editor cruft
+# ---------------------------------------------------------------------------
+.DS_Store
+._*
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---------------------------------------------------------------------------
+# GeoTessera block caches -- THE IMPORTANT ONE
+#
+# GeoTessera writes these RELATIVE TO THE CURRENT WORKING DIRECTORY and they are
+# NOT covered by --cache-dir or XDG_CACHE_HOME. Running tessera_processing.py with
+# the repo as the CWD has previously dumped ~80 GB into the checkout and filled a
+# /home quota. They are ignored here as a safety net; the real fix is to cd to a
+# scratch RUN_DIR before running (see run_tessera_embed.sh).
+# ---------------------------------------------------------------------------
+global_0.1_degree_representation/
+global_0.1_degree_tiff_all/
+**/global_0.1_degree_*/
+geotessera_cache/
+
+# ---------------------------------------------------------------------------
+# Framework / tooling output
+# ---------------------------------------------------------------------------
+lightning_logs/
+wandb/
+.cache/
+tmp/
+
+# rslearn dataset roots (imagery windows, config, item metadata). These belong on
+# scratch, but ignore them in case a dataset is ever rooted inside the repo.
+windows/
+**/layers/
+items.json
+
+# ---------------------------------------------------------------------------
+# Data and run outputs
+#
+# Nothing of this kind is currently tracked and none of it should be: embeddings,
+# imagery and prediction rasters are GBs each. Small text provenance -- the master
+# tile lists under aligned_*/ and master_tiles/ -- is deliberately NOT ignored, so
+# a published run can record exactly which tiles it used.
+#
+# To commit a genuine small example file anyway:  git add -f path/to/example.tif
+# ---------------------------------------------------------------------------
+*.npz
+*.tif
+*.tiff
+*.zarr/
+*.parquet
+*.pkl
+*.joblib
+*.h5
+*.hdf5
+*.nc
+
+# Shapefile sidecars (a .shp is never alone)
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.qix
+
+# Figures and logs produced by runs
+*.log
+slurm-*.out
+logs/
+outputs/
+outputs_*/
+results/
+
+# ---------------------------------------------------------------------------
+# Credentials -- never commit
+# ---------------------------------------------------------------------------
+.env
+*.pem
+*.key
+credentials.json
+service_account*.json
+.earthengine/
+.config/earthengine/
