@@ -15,9 +15,9 @@ directly (--modes picks which to run):
               Corrects the GEDI->ALS bias without discarding what GEDI learned.
   als_only    an RF trained on the fine-tune ALS pixels alone (no GEDI). Tells you how
               much the GEDI pre-training is actually worth on the test AOI.
-  combined    retrain from scratch on GEDI train tiles + fine-tune ALS pixels, with ALS
-              given --combined-als-frac of the total sample weight. Needs --data-dirs
-              (train tiles default to those stored in the model bundle).
+
+For GEDI train tiles + ALS AOIs trained together and tested on the GEDI test
+tiles, use train_combined_gedi_als.py.
 
 Pipeline
 --------
@@ -55,7 +55,7 @@ from sklearn.ensemble import RandomForestRegressor
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common as C  # noqa: E402
 
-ALL_MODES = ["base", "warm_start", "residual", "als_only", "combined"]
+ALL_MODES = ["base", "warm_start", "residual", "als_only"]
 
 
 def check_aoi_independence(args):
@@ -102,37 +102,6 @@ def build_residual(base, X, y, params, n_jobs, seed):
         "finetune_residual_sd": float(resid.std()), "rf_params": params}
 
 
-def build_combined(base, meta, X_ft, y_ft, args):
-    tile_ids = C.read_tile_ids(args.train_tiles) if args.train_tiles else meta.get("train_tile_ids")
-    data_dirs = args.data_dirs or meta.get("data_dirs")
-    if not tile_ids or not data_dirs:
-        sys.exit("ERROR: mode 'combined' needs GEDI training data: pass --data-dirs (and "
-                 "--train-tiles if the bundle does not store them)")
-    include_zeros = meta.get("include_zeros", False) if args.include_zeros is None \
-        else args.include_zeros
-    print("\ncombined: loading GEDI train tiles")
-    X_g, y_g, _ = C.load_tile_xy(tile_ids, data_dirs, include_zeros,
-                                 meta.get("embedding_format", "float32"),
-                                 args.max_train_samples or None, args.seed, label="GEDI train")
-    f = args.combined_als_frac
-    w_als = f * len(y_g) / ((1 - f) * len(y_ft))
-    print(f"  ALS weight per px = {w_als:.3f}  (ALS share of total weight = {f:.2f})")
-    X = np.concatenate([X_g, X_ft])
-    y = np.concatenate([y_g, y_ft])
-    w = np.concatenate([np.ones(len(y_g)), np.full(len(y_ft), w_als)])
-    del X_g
-    if isinstance(base, RandomForestRegressor):
-        p = base.get_params()
-        params = {k: p[k] for k in ("n_estimators", "max_depth", "min_samples_leaf",
-                                    "max_features")}
-    else:
-        params = meta.get("rf_params") or C.rf_params_from_args(args, "ft-")
-    m = C.fit_rf(X, y, params, args.n_jobs, args.seed, sample_weight=w, label="combined RF")
-    return m, {"n_gedi_px": int(len(y) - len(y_ft)), "n_als_px": int(len(y_ft)),
-               "als_weight_per_px": w_als, "als_weight_frac": f, "rf_params": params,
-               "data_dirs": data_dirs}
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -158,16 +127,6 @@ def main():
                    help="warm_start: trees to add (default = as many as the base has -> "
                         "50/50 GEDI/ALS)")
     C.add_rf_args(g, prefix="ft-")  # residual + als_only RF
-    g.add_argument("--combined-als-frac", type=float, default=0.5,
-                   help="combined: share of total sample weight given to the ALS pixels")
-    g.add_argument("--data-dirs", nargs="+", default=None,
-                   help="combined: GEDI npz dirs (default: from the model bundle)")
-    g.add_argument("--train-tiles", default=None,
-                   help="combined: GEDI train tile list (default: from the model bundle)")
-    g.add_argument("--include-zeros", action=argparse.BooleanOptionalAction, default=None,
-                   help="combined: *_withzeros.npz (default: as the base model was trained)")
-    g.add_argument("--max-train-samples", type=int, default=3_000_000,
-                   help="combined: cap on GEDI train pixels; 0 = no cap")
     ap.add_argument("--n-jobs", type=int, default=-1)
     ap.add_argument("--seed", type=int, default=42)
     C.add_metric_args(ap)
@@ -177,9 +136,6 @@ def main():
                     help="joblib-dump each fine-tuned model (RF bundles can be GBs)")
     ap.add_argument("--no-plot", action="store_true")
     args = ap.parse_args()
-    if not 0 < args.combined_als_frac < 1:
-        sys.exit("ERROR: --combined-als-frac must be in (0, 1)")
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -199,7 +155,6 @@ def main():
                                            C.aoi_footprint(t), lab)
                 for lab, t in (("fine-tune AOI", args.ft_aef_tif),
                                ("test AOI", args.test_aef_tif))}
-
     # Base model on the fine-tune AOI: the GEDI->ALS gap the fine-tuning has to close.
     print("\n=== base model on the FINE-TUNE AOI (all paired px, before fine-tuning) ===")
     base_on_ft = C.evaluate(y_ft, base.predict(X_ft), "base @ fine-tune AOI", args, args.seed)
@@ -228,8 +183,6 @@ def main():
             models[mode] = C.fit_rf(X_ft, y_ft, ft_params, args.n_jobs, args.seed,
                                     label="ALS-only RF")
             info[mode] = {"rf_params": ft_params}
-        elif mode == "combined":
-            models[mode], info[mode] = build_combined(base, meta, X_ft, y_ft, args)
 
     # Score every mode on the identical test-AOI pixel set.
     print(f"\n=== TEST AOI: {len(y_te):,} paired px (identical set for every mode) ===")
