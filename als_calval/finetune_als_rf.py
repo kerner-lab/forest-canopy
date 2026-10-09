@@ -21,7 +21,8 @@ tiles, use train_combined_gedi_als.py.
 
 Pipeline
 --------
-1. Load the base bundle (train_healpix_rf.py).
+1. Load the base bundle (train_healpix_rf.py). Not needed for --modes als_only alone:
+   that is a pure ALS->ALS transfer (train on the fine-tune AOI, predict the test AOI).
 2. QA + read the fine-tune AOI (AEF + ALS) and the test AOI (AEF + ALS) — the same
    alignment QA as predict_als_aoi.py. The two AOIs must not overlap (bbox check;
    --allow-aoi-overlap to override), or the test is not independent.
@@ -56,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import common as C  # noqa: E402
 
 ALL_MODES = ["base", "warm_start", "residual", "als_only"]
+AEF_DIM = 64  # AEF channels; checked against each AEF tif in QA
 
 
 def check_aoi_independence(args):
@@ -105,7 +107,9 @@ def build_residual(base, X, y, params, n_jobs, seed):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", required=True, help="base bundle from train_healpix_rf.py")
+    ap.add_argument("--model", default=None,
+                    help="base bundle from train_healpix_rf.py (optional with --modes als_only: "
+                         "then it is a pure ALS->ALS transfer run)")
     ap.add_argument("--ft-aef-tif", required=True, help="fine-tune AOI: wall-to-wall AEF tif")
     ap.add_argument("--ft-als-tif", required=True, help="fine-tune AOI: ALS tif")
     ap.add_argument("--test-aef-tif", required=True, help="test AOI: wall-to-wall AEF tif")
@@ -139,8 +143,16 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    base, meta = C.load_model_bundle(args.model)
-    n_features = C.model_n_features(base)
+    if args.model:
+        base, meta = C.load_model_bundle(args.model)
+        n_features = C.model_n_features(base)
+    else:
+        needs_base = [m for m in args.modes if m != "als_only"]
+        if needs_base:
+            sys.exit(f"ERROR: --modes {needs_base} need the GEDI --model; without it only "
+                     f"als_only (train on one ALS AOI, predict the other) can run")
+        base, meta, n_features = None, {}, AEF_DIM
+        print("No --model: ALS->ALS transfer only (als_only)")
     aoi_overlap = check_aoi_independence(args)
 
     X_ft, y_ft, _, _, qa_ft = C.load_aoi(args.ft_aef_tif, args.ft_als_tif, args, n_features,
@@ -156,8 +168,11 @@ def main():
                 for lab, t in (("fine-tune AOI", args.ft_aef_tif),
                                ("test AOI", args.test_aef_tif))}
     # Base model on the fine-tune AOI: the GEDI->ALS gap the fine-tuning has to close.
-    print("\n=== base model on the FINE-TUNE AOI (all paired px, before fine-tuning) ===")
-    base_on_ft = C.evaluate(y_ft, base.predict(X_ft), "base @ fine-tune AOI", args, args.seed)
+    base_on_ft = None
+    if base is not None:
+        print("\n=== base model on the FINE-TUNE AOI (all paired px, before fine-tuning) ===")
+        base_on_ft = C.evaluate(y_ft, base.predict(X_ft), "base @ fine-tune AOI", args,
+                                args.seed)
 
     n_ft_all = len(y_ft)
     if args.max_finetune_samples and n_ft_all > args.max_finetune_samples:
