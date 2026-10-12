@@ -10,7 +10,7 @@ cache file exists, opens cleanly, and has len(X) == len(y) within itself. It nev
 compares one source against another, so two sources can both "pass" for a tile while
 holding different pixel sets.
 
-They genuinely can differ. save_xy_npz() applies two masks
+They can differ. save_xy_npz() applies two masks
 (unified_embedding_pipeline.py:523-527):
 
     mask   = np.isfinite(y_grid)              # GEDI-valid  -- identical for all sources

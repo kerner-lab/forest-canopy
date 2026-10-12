@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
 Build a MASTER tile list: the healpix tiles that every embedding source actually has.
-
-Comparing encoders is only fair if they are trained and evaluated on identical tiles.
-In practice each source has a different set on disk — AlphaEarth and Tessera are
-downloaded and near-complete, while Presto/Prithvi/OlmoEarth lose tiles to failed
-materializes, walltime kills and truncated npz writes. Scoring them on whatever each
-happens to have confounds encoder quality with coverage.
-
 This script intersects the per-source caches against your split lists and writes the
 common tile ids, ready to hand to run_gedi_prediction_30m.py --tile-list.
 

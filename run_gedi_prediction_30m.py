@@ -23,6 +23,7 @@ import zarr
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.neural_network import MLPRegressor
 try:
     from xgboost import XGBRegressor
     _HAS_XGB = True
@@ -541,6 +542,10 @@ class GEDIPredictor30m:
                 random_state=random_state,
             )
 
+        elif self.model_type == 'mlp':
+            print(f"Training MLP...")
+            self.model = MLPRegressor()
+
         train_start = time.time()
         self.model.fit(X_train, y_fit)
         train_elapsed = time.time() - train_start
@@ -983,7 +988,7 @@ def main():
                              'Used for output naming and metadata. When --year is provided '
                              'and --preprocessed-dir is omitted, auto-constructs path as '
                              '{embeddings-dir}/{year}/{embedding-source}/.')
-    parser.add_argument('--model', choices=['rf', 'xgb', 'gb', 'lr'], default='rf',
+    parser.add_argument('--model', choices=['rf', 'xgb', 'gb', 'lr', 'mlp'], default='rf',
                         help='Model architecture: rf=RandomForest, xgb=XGBoost, '
                              'gb=GradientBoosting, lr=LogisticRegression (binned) (default: rf)')
     # Shared tree params

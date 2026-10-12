@@ -2,10 +2,8 @@
 """
 Generate WALL-TO-WALL Alpha Earth Foundation (aef-mosaic) embeddings over a shapefile.
 
-Unlike alphaearth_processing.py (which extracts sparse (X, y) at GEDI pixels per healpix
-tile), this produces a DENSE, georeferenced multi-band GeoTIFF of the 64 AEF channels at a
-chosen resolution (default 30 m) over the full extent of a boundary shapefile — exactly what
-you feed a trained model to predict a wall-to-wall map.
+Produces a DENSE, georeferenced multi-band GeoTIFF of the 64 AEF channels at a
+chosen resolution (default 30 m) over the full extent of a boundary shapefile.
 
 Pipeline:
   1. Read the boundary shapefile; compute its extent.
