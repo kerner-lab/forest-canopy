@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Generate WALL-TO-WALL Alpha Earth Foundation (aef-mosaic) embeddings over a shapefile.
+Generate WALL-TO-WALL Alpha Earth Foundation (aef-mosaic) embeddings over an AOI.
 
 Produces a DENSE, georeferenced multi-band GeoTIFF of the 64 AEF channels at a
-chosen resolution (default 30 m) over the full extent of a boundary shapefile.
+chosen resolution (default 30 m) over the full extent of an AOI, given as either
+a boundary shapefile (--shapefile) or a raster whose footprint is the AOI
+(--aoi-tif / --aoi, e.g. the ALS cal/val tifs).
 
 Pipeline:
-  1. Read the boundary shapefile; compute its extent.
+  1. Read the AOI (shapefile polygon, or raster footprint); compute its extent.
   2. Build a target grid: either copied from a reference raster (--like) so it aligns
      pixel-for-pixel with your GEDI/model grid, or constructed from --dst-crs + --resolution.
   3. Process the output in windows (bounded memory / S3 fetch):
@@ -24,6 +26,12 @@ Usage — auto UTM grid at 30 m, masked to the polygon:
     python alphaearth_wall_to_wall.py \\
         --shapefile /path/aoi.shp --year 2020 \\
         --output /path/aef_2020_wall_to_wall.tif
+
+Usage — ALS cal/val AOI by name (year looked up in AOI_YEAR, tif found in --aoi-dir):
+    python alphaearth_wall_to_wall.py \\
+        --aoi CA_LosAngeles_1_B23 --aoi-dir /path/ALS_CalVal \\
+        --output-dir /path/aef_als
+    python alphaearth_wall_to_wall.py --list-aois    # "name<TAB>year" per line, for bash
 
 Usage — align to an existing GEDI/prediction raster grid (recommended for validation):
     python alphaearth_wall_to_wall.py \\
@@ -53,8 +61,10 @@ from rasterio.transform import from_origin, array_bounds
 from rasterio.windows import Window, transform as window_transform
 from rasterio.features import geometry_mask
 from rasterio.warp import Resampling
+from rasterio.vrt import WarpedVRT
 from affine import Affine
 from pyproj import CRS
+from shapely.geometry import box
 
 # Reuse the proven aef-mosaic helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -65,6 +75,34 @@ try:
     _HAS_TQDM = True
 except ImportError:
     _HAS_TQDM = False
+
+
+# ALS cal/val AOIs -> AEF year to export. Keys are the AOI tif stems (<key>.tif in
+# --aoi-dir); each year matches the ALS acquisition so embeddings and lidar agree.
+AOI_YEAR = {
+    'CA_LosAngeles_1_B23_4326': 2024,
+    'CA_CaliforniaGaps_4_B23_4326': 2023,
+    'OR_SWCentralSycan_4_B21_4326': 2022,
+    'CA_NorthernCA_1_B22_4326': 2022,
+    'CA25_Allen_4326': 2018,
+    'CA20_Brande_4326': 2018,
+    '2017_USFS_Lidar_Umpqua_National_Forest_Tiller_OR_4326': 2017,
+    '2017_USFS_Lidar_Diamond_Lake_OR_4326': 2017,
+}
+
+
+def raster_footprint(path: str) -> gpd.GeoDataFrame:
+    """The raster's bounding box as a one-polygon GeoDataFrame in its own CRS.
+
+    Edges are densified so the box stays faithful when reprojected (e.g. a
+    EPSG:4326 tif onto UTM, where straight lon/lat edges become curves).
+    """
+    with rasterio.open(path) as src:
+        if src.crs is None:
+            sys.exit(f"ERROR: {path} has no CRS")
+        b = src.bounds
+        geom = box(*b).segmentize(max(b.right - b.left, b.top - b.bottom) / 100)
+        return gpd.GeoDataFrame(geometry=[geom], crs=src.crs)
 
 
 def utm_epsg_from_lonlat(lon: float, lat: float) -> int:
@@ -135,9 +173,20 @@ def fetch_aef_block(ds, aef_crs, dst_crs, win_transform, win_w, win_h, year, buf
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--shapefile", required=True, help="boundary shapefile (.shp)")
-    ap.add_argument("--year", type=int, required=True, help="aef year, e.g. 2020")
-    ap.add_argument("--output", required=True, help="output GeoTIFF path (.tif)")
+    aoi = ap.add_mutually_exclusive_group()
+    aoi.add_argument("--shapefile", help="boundary shapefile (.shp)")
+    aoi.add_argument("--aoi-tif", help="raster whose footprint (bounding box) is the AOI")
+    aoi.add_argument("--aoi", help="AOI name from AOI_YEAR; reads <--aoi-dir>/<name>.tif "
+                                   "and defaults --year to AOI_YEAR[name]")
+    aoi.add_argument("--list-aois", action="store_true",
+                     help="print 'name<TAB>year' for every AOI_YEAR entry and exit")
+    ap.add_argument("--aoi-dir", help="folder holding the AOI tifs (with --aoi)")
+    ap.add_argument("--year", type=int, default=None,
+                    help="aef year, e.g. 2020 (default with --aoi/--aoi-tif: AOI_YEAR "
+                         "lookup by tif stem)")
+    ap.add_argument("--output", default=None, help="output GeoTIFF path (.tif)")
+    ap.add_argument("--output-dir", default=None,
+                    help="instead of --output: write <output-dir>/<aoi stem>_aef_<year>.tif")
     ap.add_argument("--like", default=None,
                     help="reference raster to copy the grid from (crs/transform/size); "
                          "overrides --dst-crs/--resolution and aligns pixel-for-pixel")
@@ -149,7 +198,9 @@ def main():
     ap.add_argument("--buffer", type=float, default=0.01,
                     help="degrees to pad each window before aef subsetting (edge coverage)")
     ap.add_argument("--no-mask", action="store_true",
-                    help="keep the full bounding box (default: mask pixels outside the polygon)")
+                    help="keep the full bounding box (default: mask pixels outside the "
+                         "polygon; with --aoi-tif/--aoi, outside the raster's valid pixels, "
+                         "and skip blocks with none without fetching aef)")
     ap.add_argument("--compress", default="lzw",
                     help="GeoTIFF compression (lzw, deflate, none). Default lzw — see --predictor")
     ap.add_argument("--predictor", type=int, default=0,
@@ -163,23 +214,66 @@ def main():
                     help="print the target grid + block count and exit (no S3 fetch)")
     args = ap.parse_args()
 
-    out_path = Path(args.output)
+    if args.list_aois:
+        for name, year in AOI_YEAR.items():
+            print(f"{name}\t{year}")
+        return
+
+    if args.aoi:
+        if not args.aoi_dir:
+            ap.error("--aoi needs --aoi-dir")
+        if args.aoi not in AOI_YEAR:
+            ap.error(f"--aoi {args.aoi!r} is not in AOI_YEAR: {sorted(AOI_YEAR)}")
+        args.aoi_tif = str(Path(args.aoi_dir) / f"{args.aoi}.tif")
+    if not (args.shapefile or args.aoi_tif):
+        ap.error("give one of --shapefile, --aoi-tif, --aoi")
+
+    aoi_path = args.shapefile or args.aoi_tif
+    if not Path(aoi_path).exists():
+        sys.exit(f"ERROR: AOI not found: {aoi_path}")
+    stem = Path(aoi_path).stem
+    if args.year is None:
+        if args.aoi_tif and stem in AOI_YEAR:
+            args.year = AOI_YEAR[stem]
+        else:
+            ap.error(f"--year is required ({stem!r} is not in AOI_YEAR)")
+    elif args.aoi_tif and stem in AOI_YEAR and args.year != AOI_YEAR[stem]:
+        print(f"Warning: --year {args.year} overrides AOI_YEAR[{stem!r}]={AOI_YEAR[stem]}",
+              file=sys.stderr)
+
+    if args.output:
+        out_path = Path(args.output)
+    elif args.output_dir:
+        out_path = Path(args.output_dir) / f"{stem}_aef_{args.year}.tif"
+    else:
+        ap.error("give --output or --output-dir")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    gdf = gpd.read_file(args.shapefile)
-    if gdf.crs is None:
-        print("Warning: shapefile has no CRS; assuming EPSG:4326", file=sys.stderr)
-        gdf = gdf.set_crs(4326)
-    print(f"Loaded shapefile: {len(gdf)} feature(s), CRS={gdf.crs}")
+    if args.aoi_tif:
+        gdf = raster_footprint(args.aoi_tif)
+        print(f"AOI raster footprint: {args.aoi_tif}  CRS={gdf.crs.to_string()}  year={args.year}")
+    else:
+        gdf = gpd.read_file(args.shapefile)
+        if gdf.crs is None:
+            print("Warning: shapefile has no CRS; assuming EPSG:4326", file=sys.stderr)
+            gdf = gdf.set_crs(4326)
+        print(f"Loaded shapefile: {len(gdf)} feature(s), CRS={gdf.crs}")
 
     dst_crs, transform, width, height = build_target_grid(
         gdf, args.like, args.dst_crs, args.resolution)
     res_x = abs(transform.a)
     n_blocks = len(list(iter_windows(width, height, args.block_size)))
     est_gb = 64 * width * height * 4 / 1e9
-    print(f"Target grid : {width} x {height} px  @ {res_x:.1f} m  CRS={dst_crs.to_string()}")
+    res_str = f"{res_x:.6g} deg" if CRS.from_user_input(dst_crs).is_geographic else f"{res_x:.1f} m"
+    print(f"Target grid : {width} x {height} px  @ {res_str}  CRS={dst_crs.to_string()}")
     print(f"Blocks      : {n_blocks} ({args.block_size}px)   uncompressed ~{est_gb:.1f} GB (64 band f32)")
-    print(f"Mask        : {'OFF (full bbox)' if args.no_mask else 'ON (clip to polygon)'}")
+    if args.no_mask:
+        mask_desc = "OFF (full bbox)"
+    elif args.aoi_tif:
+        mask_desc = "ON (clip to AOI raster's valid pixels; skip blocks with none)"
+    else:
+        mask_desc = "ON (clip to polygon)"
+    print(f"Mask        : {mask_desc}")
 
     if args.dry_run:
         print("Dry run — re-run without --dry-run to generate.")
@@ -194,7 +288,15 @@ def main():
     if args.year not in years:
         print(f"Warning: year {args.year} not in {years}", file=sys.stderr)
 
-    gdf_dst = gdf.to_crs(dst_crs) if not args.no_mask else None
+    # Mask source: an AOI raster's valid pixels (warped onto the output grid; exact when
+    # --like is the AOI raster itself), else the shapefile polygon.
+    aoi_vrt = gdf_dst = None
+    if not args.no_mask:
+        if args.aoi_tif:
+            aoi_vrt = WarpedVRT(rasterio.open(args.aoi_tif), crs=dst_crs, transform=transform,
+                                width=width, height=height, resampling=Resampling.nearest)
+        else:
+            gdf_dst = gdf.to_crs(dst_crs)
     nodata = np.float32("nan")
 
     profile = dict(
@@ -208,7 +310,7 @@ def main():
             profile["predictor"] = args.predictor
 
     t0 = time.time()
-    n_written = n_empty = 0
+    n_written = n_empty = n_no_aoi = 0
     probe = None        # (window, row, col) of one pixel known to be finite when written
     with rasterio.open(out_path, "w", **profile) as dst:
         for b in range(n_channels):
@@ -218,6 +320,13 @@ def main():
         it = tqdm(windows, desc="blocks") if _HAS_TQDM else windows
         for win in it:
             wt = window_transform(win, transform)
+            aoi_valid = None
+            if aoi_vrt is not None:
+                aoi_valid = (aoi_vrt.read_masks(1, window=win) > 0) & \
+                    np.isfinite(aoi_vrt.read(1, window=win))
+                if not aoi_valid.any():     # no AOI data here: don't fetch aef at all
+                    n_no_aoi += 1
+                    continue
             data, src_transform = fetch_aef_block(
                 ds, aef_crs, dst_crs, wt, win.width, win.height, args.year, args.buffer)
             if data is None:
@@ -236,6 +345,8 @@ def main():
                 outside = geometry_mask(gdf_dst.geometry, out_shape=(win.height, win.width),
                                         transform=wt, invert=False)  # True where OUTSIDE polygon
                 block[:, outside] = np.nan
+            if aoi_valid is not None:
+                block[:, ~aoi_valid] = np.nan
 
             dst.write(block, window=win)
             n_written += 1
@@ -262,14 +373,16 @@ def main():
 
     elapsed = time.time() - t0
     size_mb = out_path.stat().st_size / 1e6
-    print(f"\nDone in {elapsed:.0f}s. blocks written={n_written} empty={n_empty}")
+    print(f"\nDone in {elapsed:.0f}s. blocks written={n_written} empty={n_empty} "
+          f"skipped (no AOI data)={n_no_aoi}")
     print(f"Output: {out_path}  ({size_mb:.1f} MB on disk, {n_channels} bands)")
 
     summary = {
-        "shapefile": args.shapefile, "year": args.year, "output": str(out_path),
+        "shapefile": args.shapefile, "aoi_tif": args.aoi_tif, "year": args.year, "output": str(out_path),
         "dst_crs": dst_crs.to_string(), "resolution_m": res_x,
         "width": width, "height": height, "n_channels": n_channels,
         "masked": not args.no_mask, "blocks_written": n_written, "blocks_empty": n_empty,
+        "blocks_no_aoi_data": n_no_aoi,
         "generated": datetime.now().isoformat(timespec="seconds"),
     }
     with open(out_path.with_suffix(".json"), "w") as f:
