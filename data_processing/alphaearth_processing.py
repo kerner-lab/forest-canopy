@@ -177,10 +177,15 @@ def dequantize_aef(data: np.ndarray) -> np.ndarray:
         f = (x / 127.5)^2 * sign(x)
     nodata pixels (value == -128) are set to 0.0.
     """
-    nodata_mask = data == AEF_INT8_NODATA
-    x = data.astype(np.float32)
-    out = (x / 127.5) ** 2 * np.sign(x)
-    out[nodata_mask] = 0.0
+    # One leading-axis slice at a time: same formula (bitwise-identical output), but the
+    # float32 temporaries are one slice, not the whole array. Whole-array, a 64-band
+    # wall-to-wall block (~3300^2 px) peaked at ~8 GB here and OOM-killed RM-shared jobs.
+    out = np.empty(data.shape, dtype=np.float32)
+    for i in range(data.shape[0]):
+        x = data[i].astype(np.float32)
+        o = (x / 127.5) ** 2 * np.sign(x)
+        o[data[i] == AEF_INT8_NODATA] = 0.0
+        out[i] = o
     return out
 
 
