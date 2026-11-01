@@ -9,6 +9,8 @@ a boundary shapefile (--shapefile) or a raster whose footprint is the AOI
 
 Pipeline:
   1. Read the AOI (shapefile polygon, or raster footprint); compute its extent.
+     With --aoi/--aoi-tif the output grid defaults to the AOI (ALS) raster's own
+     grid, so embeddings and ALS pair pixel-for-pixel (--own-grid to opt out).
   2. Build a target grid: either copied from a reference raster (--like) so it aligns
      pixel-for-pixel with your GEDI/model grid, or constructed from --dst-crs + --resolution.
   3. Process the output in windows (bounded memory / S3 fetch):
@@ -189,10 +191,19 @@ def main():
                     help="instead of --output: write <output-dir>/<aoi stem>_aef_<year>.tif")
     ap.add_argument("--like", default=None,
                     help="reference raster to copy the grid from (crs/transform/size); "
-                         "overrides --dst-crs/--resolution and aligns pixel-for-pixel")
+                         "overrides --dst-crs/--resolution and aligns pixel-for-pixel. "
+                         "Default with --aoi/--aoi-tif: the AOI (ALS) raster itself")
+    ap.add_argument("--own-grid", action="store_true",
+                    help="with --aoi/--aoi-tif, build an auto-UTM/--dst-crs grid at "
+                         "--resolution instead of using the AOI raster's grid")
     ap.add_argument("--dst-crs", default=None,
                     help="target CRS (e.g. EPSG:32610). Default: auto-UTM from AOI centroid")
     ap.add_argument("--resolution", type=float, default=30.0, help="target pixel size (m)")
+    ap.add_argument("--resampling", default="bilinear",
+                    choices=("bilinear", "average", "nearest"),
+                    help="10 m -> output-grid resampling. average aggregates every 10 m "
+                         "pixel in the cell (olmoearth_wall_to_wall.py default); use the "
+                         "same choice for every encoder you compare")
     ap.add_argument("--block-size", type=int, default=1024,
                     help="output window size in pixels for memory-bounded processing")
     ap.add_argument("--buffer", type=float, default=0.01,
@@ -252,6 +263,8 @@ def main():
     if args.aoi_tif:
         gdf = raster_footprint(args.aoi_tif)
         print(f"AOI raster footprint: {args.aoi_tif}  CRS={gdf.crs.to_string()}  year={args.year}")
+        if args.like is None and not args.own_grid:
+            args.like = args.aoi_tif        # align pixel-for-pixel with the ALS raster
     else:
         gdf = gpd.read_file(args.shapefile)
         if gdf.crs is None:
@@ -338,7 +351,7 @@ def main():
                 source=data, destination=block,
                 src_transform=src_transform, src_crs=aef_crs,
                 dst_transform=wt, dst_crs=dst_crs,
-                src_nodata=0.0, dst_nodata=np.nan, resampling=Resampling.bilinear,
+                src_nodata=0.0, dst_nodata=np.nan, resampling=Resampling[args.resampling],
             )
 
             if gdf_dst is not None:
@@ -381,7 +394,7 @@ def main():
         "shapefile": args.shapefile, "aoi_tif": args.aoi_tif, "year": args.year, "output": str(out_path),
         "dst_crs": dst_crs.to_string(), "resolution_m": res_x,
         "width": width, "height": height, "n_channels": n_channels,
-        "masked": not args.no_mask, "blocks_written": n_written, "blocks_empty": n_empty,
+        "masked": not args.no_mask, "resampling": args.resampling, "blocks_written": n_written, "blocks_empty": n_empty,
         "blocks_no_aoi_data": n_no_aoi,
         "generated": datetime.now().isoformat(timespec="seconds"),
     }
