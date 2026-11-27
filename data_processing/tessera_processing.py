@@ -107,6 +107,40 @@ def open_geotessera(cache_dir: str = None, dataset_version: str = None):
     return gt
 
 
+def open_geotessera_zarr(cache_dir: str = None, store_url: str = None,
+                         cache_max_gb: float = None):
+    """Open the cloud-native Zarr store (geotessera >= 0.10, Python >= 3.12).
+
+    The default store is the COMPLETE global TESSERA v1.1 run (dClimate variant).
+    The NPY tiles for v1.1 exist only for the 'cambridge' test run, whose embeddings
+    do not interoperate with dClimate, and NPY is deprecated upstream.
+    """
+    try:
+        from geotessera import GeoTesseraZarr
+    except ImportError as exc:
+        raise ImportError(
+            "GeoTesseraZarr needs geotessera >= 0.10 (Python >= 3.12): "
+            "`pip install 'geotessera>=0.11'`."
+        ) from exc
+
+    kwargs = {}
+    if store_url:
+        kwargs["store_url"] = store_url
+    if cache_dir:
+        kwargs["cache_dir"] = cache_dir
+        if cache_max_gb:
+            kwargs["cache_max_size"] = int(cache_max_gb * 1024 ** 3)
+    tic = time.time()
+    gt = GeoTesseraZarr(**kwargs)
+    print(f"Opened GeoTesseraZarr in {time.time() - tic:.2f}s  "
+          f"(dataset={getattr(gt, 'dataset', None)}, years={getattr(gt, 'years', '?')})")
+    return gt
+
+
+def _is_zarr_client(gt) -> bool:
+    return type(gt).__name__ == "GeoTesseraZarr"
+
+
 # ---------------------------------------------------------------------------
 # Tile bounds
 # ---------------------------------------------------------------------------
@@ -164,6 +198,55 @@ def iter_covering_tiles(gt, blocks, logger):
         # fetch_embeddings yields (year, tile_lon, tile_lat, embedding, crs, transform)
         _, _, _, emb, crs, transform = record
         yield _to_float32_chw(emb, logger), CRS.from_user_input(crs), transform
+
+
+def split_bbox_by_utm_zone(lon_min, lat_min, lon_max, lat_max):
+    """Split a WGS84 bbox at UTM zone boundaries (every 6 deg from -180).
+
+    GeoTesseraZarr.read_region / iter_region serve a bbox from the zone holding its
+    CENTRE only, so a tile straddling a zone edge would lose the far side. Reading
+    each zone's part separately and letting the feathered mosaic blend them avoids that.
+    """
+    edges = [-180.0 + 6.0 * k for k in range(61)]
+    cuts = [lon_min] + [e for e in edges if lon_min < e < lon_max] + [lon_max]
+    return [(a, lat_min, b, lat_max) for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+
+
+def list_zarr_parts(gt, lon_min, lat_min, lon_max, lat_max, year, buffer):
+    """Zarr counterpart of list_covering_blocks: the per-UTM-zone sub-bboxes to read.
+
+    Returns [] if the year is not in the store. No embedding data is read.
+    """
+    years = list(getattr(gt, "years", []) or [])
+    if years and int(year) not in [int(y) for y in years]:
+        return []
+    return split_bbox_by_utm_zone(lon_min - buffer, lat_min - buffer,
+                                  lon_max + buffer, lat_max + buffer)
+
+
+def iter_zarr_tiles(gt, parts, year, logger, strip_rows: int = 256):
+    """Yield (embedding(C,H,W) float32, crs, transform) row-strip by row-strip.
+
+    iter_region returns dequantised float32 (H, W, 128) on the zone's NATIVE UTM grid
+    with NaN where there is no embedding. NaN -> 0.0 because the mosaic treats 0.0 as
+    nodata (same convention as the NPY path). Strips abut like the old 0.1 deg blocks,
+    so the feathered blend in reproject_tiles_to_gedi handles their seams the same way.
+    Peak memory per strip ~ strip_rows * width * 128 * 4 B (x2 during the transpose).
+    """
+    for part in parts:
+        try:
+            stream = gt.iter_region(part, int(year), strip_rows=strip_rows)
+            for block, transform, crs in stream:
+                if block is None or block.size == 0:
+                    continue
+                block = np.nan_to_num(block, nan=0.0, copy=False)
+                if not np.any(block):
+                    continue                       # all-nodata strip (ocean etc.)
+                yield _to_float32_chw(block, logger), CRS.from_user_input(crs), transform
+                del block
+        except ValueError as exc:
+            # e.g. part outside every zone grid, or year unavailable for that zone
+            logger.warning(f"Zarr read skipped for bbox {part}: {exc}")
 
 
 def _to_float32_chw(emb: np.ndarray, logger: logging.Logger) -> np.ndarray:
@@ -502,6 +585,7 @@ def process_tile(
     save_geotiff: bool = False,
     geotiff_bands=None,
     dense: bool = False,
+    zarr_strip_rows: int = 256,
 ) -> dict:
     """Process one tile end-to-end; return a status dict.
 
@@ -560,15 +644,25 @@ def process_tile(
         # Registry lookup first (cheap, no downloads) so an uncovered tile costs nothing,
         # then STREAM the blocks into the reprojection instead of listing them. At ~485 MB
         # per block as float32, listing a 90-block tile would need ~44 GB of RAM.
-        blocks = list_covering_blocks(
-            gt, lon_min, lat_min, lon_max, lat_max, year, buffer
-        )
-        if not blocks:
-            logger.warning(f"Tile {healpix_id}: no TESSERA tiles cover bounds")
-            return {"status": "empty_subset", "healpix_id": int(healpix_id)}
-        n_blocks = len(blocks)
-        print(f"  Tile {healpix_id}: streaming {n_blocks} TESSERA block(s)")
-        tiles = iter_covering_tiles(gt, blocks, logger)   # generator, one block live
+        if _is_zarr_client(gt):
+            blocks = list_zarr_parts(gt, lon_min, lat_min, lon_max, lat_max, year, buffer)
+            if not blocks:
+                logger.warning(f"Tile {healpix_id}: year {year} not in Zarr store "
+                               f"(years={getattr(gt, 'years', '?')})")
+                return {"status": "empty_subset", "healpix_id": int(healpix_id)}
+            n_blocks = len(blocks)
+            print(f"  Tile {healpix_id}: streaming Zarr strips from {n_blocks} UTM zone part(s)")
+            tiles = iter_zarr_tiles(gt, blocks, year, logger, strip_rows=zarr_strip_rows)
+        else:
+            blocks = list_covering_blocks(
+                gt, lon_min, lat_min, lon_max, lat_max, year, buffer
+            )
+            if not blocks:
+                logger.warning(f"Tile {healpix_id}: no TESSERA tiles cover bounds")
+                return {"status": "empty_subset", "healpix_id": int(healpix_id)}
+            n_blocks = len(blocks)
+            print(f"  Tile {healpix_id}: streaming {n_blocks} TESSERA block(s)")
+            tiles = iter_covering_tiles(gt, blocks, logger)   # generator, one block live
 
         # 4. Load GEDI target geometry.
         gedi_data, gedi_nodata, gedi_transform, gedi_crs, gedi_h, gedi_w = \
@@ -799,7 +893,18 @@ def main():
     parser.add_argument("--cache-dir", default=None,
                         help="GeoTessera download cache directory (default: library default)")
     parser.add_argument("--dataset-version", default=None,
-                        help="GeoTessera dataset version (e.g. v1.1); default: library default")
+                        help="GeoTessera dataset version (e.g. v1); default: library default (v1 in geotessera 0.8)")
+    parser.add_argument(
+        "--backend", choices=["npy", "zarr"], default="npy",
+        help="npy: legacy per-0.1deg-block GeoTessera downloads (--dataset-version). "
+             "zarr: GeoTesseraZarr cloud store, default = complete global v1.1 "
+             "(dClimate). zarr needs geotessera>=0.10 / Python>=3.12.")
+    parser.add_argument("--zarr-store", default=None,
+                        help="zarr backend: store URL (default: library default, v1.1 dClimate)")
+    parser.add_argument("--zarr-strip-rows", type=int, default=256,
+                        help="zarr backend: rows per streamed strip (memory ~ rows*width*512 B)")
+    parser.add_argument("--cache-max-gb", type=float, default=None,
+                        help="zarr backend: bound the --cache-dir read cache (default unbounded)")
     parser.add_argument("--check-only", action="store_true",
                         help="Report which output .npz files already exist in --output-dir "
                              "and exit. This is a LOCAL cache check only — it never contacts "
@@ -886,8 +991,43 @@ def main():
         return
 
     # Open GeoTessera once (lazy; tiles fetched per-tile inside process_tile)
-    print("\nOpening GeoTessera (lazy)...")
-    gt = open_geotessera(cache_dir=args.cache_dir, dataset_version=args.dataset_version)
+    if args.backend == "zarr":
+        print("\nOpening GeoTesseraZarr...")
+        if args.dataset_version:
+            print("  NOTE: --dataset-version is ignored by the zarr backend; use --zarr-store.")
+        gt = open_geotessera_zarr(cache_dir=args.cache_dir, store_url=args.zarr_store,
+                                  cache_max_gb=args.cache_max_gb)
+    else:
+        print("\nOpening GeoTessera (lazy)...")
+        gt = open_geotessera(cache_dir=args.cache_dir, dataset_version=args.dataset_version)
+
+    if args.check_coverage and args.backend == "zarr":
+        # Cheap check: is the year in the store, and does each tile's centre hold an
+        # embedding? probe() reads one pixel, so this is fast even for all 311 tiles.
+        years = list(getattr(gt, "years", []) or [])
+        print(f"\nZarr store years: {years}")
+        if years and int(args.year) not in [int(y) for y in years]:
+            print(f"Year {args.year} NOT available in this store.")
+            return
+        shp_crs = gdf.crs if gdf.crs is not None else CRS.from_epsg(4326)
+        statuses: dict = {}
+        for i, tid in enumerate(tile_ids, 1):
+            lon_min, lat_min, lon_max, lat_max = bounds_to_crs(
+                *get_tile_bounds(tid, gdf), shp_crs, CRS.from_epsg(4326))
+            lon_c, lat_c = (lon_min + lon_max) / 2, (lat_min + lat_max) / 2
+            try:
+                _vec, status = gt.probe(lon_c, lat_c, int(args.year))
+            except Exception as exc:
+                status = f"error:{type(exc).__name__}"
+            statuses.setdefault(status, []).append(tid)
+            print(f"[{i}/{len(tile_ids)}] healpix_{tid}: centre ({lon_c:.3f},{lat_c:.3f}) "
+                  f"-> {status}", file=sys.stderr, flush=True)
+        print(f"\nYear {args.year}: tile-centre probe results")
+        for status, ids in sorted(statuses.items()):
+            print(f"  {status:12s}: {len(ids)}  e.g. {ids[:10]}")
+        print("  (non-'valid' at the centre can still be a coastal/water centre — "
+              "it is a spot check, not a full coverage test)")
+        return
 
     if args.check_coverage:
         # Registry lookup only — load_blocks_for_region returns the identifiers of the
@@ -944,6 +1084,7 @@ def main():
             keep_zeros=args.keep_zeros,
             save_geotiff=args.save_geotiff,
             geotiff_bands=args.geotiff_bands,
+            zarr_strip_rows=args.zarr_strip_rows,
         )
         results.append(result)
 

@@ -186,7 +186,7 @@ def main():
     ap.add_argument("--cache-dir", default=None,
                     help="GeoTessera cache directory (default: library default)")
     ap.add_argument("--dataset-version", default=None,
-                    help="GeoTessera dataset version (e.g. v1.1); default: library default")
+                    help="GeoTessera dataset version (e.g. v1); default: library default (v1 in geotessera 0.8)")
     ap.add_argument("--tmp-dir", default=None,
                     help="where to put the accumulator memmaps (~ size of the uncompressed "
                          "output). Default: next to the output. Use node-local scratch on HPC.")
